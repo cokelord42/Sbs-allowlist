@@ -1,5 +1,8 @@
-[
-	"64bfe29c33400ec8e9f8671eff5b4bfdd06962dbe20aea8614fe6b25ff8fb0ab",
-	"390389efbb63bd76d00b51bceb7d4d56d4941704a62956ae489af49bb7c2e849",
-	"9edd3f31869501fd5ed3f42ffd81e49f44d6ad6f0020dad970e7be6b39c0bad6"
-]
+{
+  "hashes": [
+    "390389efbb63bd76d00b51bceb7d4d56d4941704a62956ae489af49bb7c2e849",
+    "64bfe29c33400ec8e9f8671eff5b4bfdd06962dbe20aea8614fe6b25ff8fb0ab",
+    "9edd3f31869501fd5ed3f42ffd81e49f44d6ad6f0020dad970e7be6b39c0bad6"
+  ],
+  "signature": "wlaOss1sHSkM9Lt+IH32H0RgUOEfP4LQI89epZsM8helUKiI+KeTddXZKqxWomZshoRr3iOniLvUKACOVpt0Cg=="
+}
