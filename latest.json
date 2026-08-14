@@ -1,6 +1,6 @@
 {
-  "version": "0.6.4",
-  "downloadUrl": "https://github.com/cokelord42/sbs-allowlist/releases/download/v0.6.4/skyblocksimplified-0.6.4.jar",
-  "sha256": "8672e8cf9f0b0a2128abcebce5ccf473a3211d148865608f95426e6ad2e44803",
-  "signature": "8jZSNE2nAgCzkt7fK+dluMYl9tz9wLeUfbUwK3zTSq25TqV8OUKHEWYd3gw4ESJWQy6cP6Xy6RwHi+lU72z9DA=="
+  "version": "0.6.5",
+  "downloadUrl": "https://github.com/cokelord42/sbs-allowlist/releases/download/v0.6.5/skyblocksimplified-0.6.5.jar",
+  "sha256": "04456cbcaf4f563d01a6f913297ee9e72fe33a3e79efa710a4578a9cd763d5a8",
+  "signature": "lAlpUzJ6YElj7SwOv3bbXkDpp8FZLeeDGADsPtrWwuY/EWvJWWsyMZ5owQDUEmAYhpZQHcBgGPSyICcMQGd8Cg=="
 }
