@@ -1,0 +1,32 @@
+{
+	"schemaVersion": 1,
+	"id": "skyblocksimplified",
+	"version": "${version}",
+	"name": "SkyblockSimplified",
+	"description": "A personal all-in-one Hypixel Skyblock utility mod.",
+	"authors": [
+		"cokelord"
+	],
+	"license": "ARR",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"com.cokelord.skyblocksimplified.SkyblockSimplified"
+		],
+		"client": [
+			"com.cokelord.skyblocksimplified.client.SkyblockSimplifiedClient"
+		]
+	},
+	"mixins": [
+		"skyblocksimplified.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"hypixel-mod-api": "*"
+	}
+}

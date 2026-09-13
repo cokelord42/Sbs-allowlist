@@ -1,0 +1,88 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+
+	// Hypixel's own official Mod API library (net.hypixel:mod-api) — the real, server-pushed location
+	// packet this project's island detection now prefers over sidebar scraping when available. Not a
+	// Fabric mod itself (no fabric.mod.json), just the plain packet/protocol classes, so plain
+	// `implementation` below is correct — the actual runtime bridge that puts these packets on the wire is
+	// the separate, optional "Hypixel Mod API" Fabric mod (id "hypixel-mod-api") players can install; this
+	// project only needs to compile against the packet classes, isolated behind a runtime
+	// FabricLoader.isModLoaded() check (see HypixelLocationApi) so nothing breaks for players who don't
+	// have that mod installed.
+	maven { url = "https://repo.hypixel.net/repository/Hypixel/" }
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"skyblocksimplified" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	// To change the versions see the gradle.properties file
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+	// Fabric API. This is technically optional, but you probably want it anyway.
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// See the repositories block above for why this is plain `implementation`, not `modImplementation`.
+	implementation "net.hypixel:mod-api:1.0.2"
+
+	// Per user request ("Add more audio formats, like mp3... I just need support for like mp3, wav, and
+	// ogg"): javax.sound.sampled (what CustomSoundOption already decodes every sound through) has no
+	// built-in mp3/ogg support at all — these register real javax.sound.sampled SPI providers (discovered
+	// automatically via META-INF/services, same mechanism the JDK's own built-in WAV/AU/AIFF providers use)
+	// for mp3 (mp3spi, backed by the pure-Java JLayer decoder) and Ogg Vorbis (vorbisspi, backed by
+	// jogg/jorbis) — so CustomSoundOption's existing AudioSystem.getAudioInputStream(file) call transparently
+	// gains mp3/ogg decoding with NO changes to the decoding code itself, only the file-picker's own filter
+	// list. `include` (Fabric Loom's jar-in-jar mechanism) bundles these — and their own transitive
+	// dependencies (jlayer, jogg, jorbis, tritonus-share) — directly inside this mod's own jar, so players
+	// don't need to separately install anything.
+	implementation "com.googlecode.soundlibs:mp3spi:1.9.5.4"
+	include "com.googlecode.soundlibs:mp3spi:1.9.5.4"
+	implementation "com.googlecode.soundlibs:vorbisspi:1.0.3.3"
+	include "com.googlecode.soundlibs:vorbisspi:1.0.3.3"
+
+	// `include` only bundles the exact coordinate named — it does NOT pull in that dependency's own
+	// transitive jars, so mp3spi/vorbisspi's real decoder backends (jlayer, jorbis) and their shared
+	// tritonus-share helper classes must be included explicitly too, or Fabric Loader extracts an
+	// incomplete set of nested jars and decoding throws NoClassDefFoundError the first time it runs.
+	include "com.googlecode.soundlibs:jlayer:1.0.1.4"
+	include "com.googlecode.soundlibs:jorbis:0.0.17.4"
+	include "com.googlecode.soundlibs:tritonus-share:0.3.7.4"
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+}
+
+java {
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
