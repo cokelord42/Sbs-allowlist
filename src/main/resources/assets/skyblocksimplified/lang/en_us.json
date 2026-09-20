@@ -1,0 +1,23 @@
+{
+	"key.skyblocksimplified.open_gui": "Open SkyblockSimplified",
+	"key.category.skyblocksimplified.main": "SkyblockSimplified",
+	"key.skyblocksimplified.loadout_slot_1": "Slot 1",
+	"key.skyblocksimplified.loadout_slot_2": "Slot 2",
+	"key.skyblocksimplified.loadout_slot_3": "Slot 3",
+	"key.skyblocksimplified.loadout_slot_4": "Slot 4",
+	"key.skyblocksimplified.loadout_slot_5": "Slot 5",
+	"key.skyblocksimplified.loadout_slot_6": "Slot 6",
+	"key.skyblocksimplified.loadout_slot_7": "Slot 7",
+	"key.skyblocksimplified.loadout_slot_8": "Slot 8",
+	"key.skyblocksimplified.loadout_slot_9": "Slot 9",
+	"key.skyblocksimplified.loadout_slot_10": "Slot 10",
+	"key.skyblocksimplified.loadout_slot_11": "Slot 11",
+	"key.skyblocksimplified.loadout_slot_12": "Slot 12",
+	"key.skyblocksimplified.slot_lock_toggle": "Lock/Unlock Hovered Slot",
+	"key.skyblocksimplified.dungeon_routes_next_step": "Keybind for next step",
+	"key.skyblocksimplified.boss_guide_skip_step": "Skip current step",
+	"key.skyblocksimplified.leap_top_left": "Top Left:",
+	"key.skyblocksimplified.leap_top_right": "Top Right:",
+	"key.skyblocksimplified.leap_bottom_left": "Bottom Left:",
+	"key.skyblocksimplified.leap_bottom_right": "Bottom Right:"
+}

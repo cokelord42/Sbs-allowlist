@@ -1,0 +1,28 @@
+{
+  "1": [
+    { "image": "f1_boss", "boundsMin": [-65, 70, -3], "boundsMax": [-19, 90, 45], "widthInWorld": 46, "heightInWorld": 48, "topLeftX": -65, "topLeftZ": -3, "imageWidth": 480, "imageHeight": 480 }
+  ],
+  "2": [
+    { "image": "f2_boss", "boundsMin": [-34, 54, -35], "boundsMax": [18, 100, 15], "widthInWorld": 52, "heightInWorld": 50, "topLeftX": -34, "topLeftZ": -35, "imageWidth": 499, "imageHeight": 480 }
+  ],
+  "3": [
+    { "image": "f3_boss", "boundsMin": [-33, 64, -34], "boundsMax": [35, 118, 37], "widthInWorld": 68, "heightInWorld": 73, "topLeftX": -33, "topLeftZ": -34, "imageWidth": 480, "imageHeight": 501 }
+  ],
+  "4": [
+    { "image": "f4_boss", "boundsMin": [-37, 53, -37], "boundsMax": [47, 114, 47], "widthInWorld": 84, "heightInWorld": 84, "topLeftX": -33, "topLeftZ": -34, "imageWidth": 480, "imageHeight": 480 }
+  ],
+  "5": [
+    { "image": "f5_boss", "boundsMin": [-35, 53, -5], "boundsMax": [45, 112, 82], "widthInWorld": 80, "heightInWorld": 80, "topLeftX": -35, "topLeftZ": 2, "imageWidth": 480, "imageHeight": 480 }
+  ],
+  "6": [
+    { "image": "f6_boss", "boundsMin": [-31, 51, -5], "boundsMax": [13, 110, 94], "widthInWorld": 44, "heightInWorld": 99, "topLeftX": -31, "topLeftZ": -5, "imageWidth": 388, "imageHeight": 854 }
+  ],
+  "7": [
+    { "image": "f7_boss_end", "boundsMin": [14, 161, 115], "boundsMax": [42, 189, 153], "widthInWorld": 28, "heightInWorld": 38, "topLeftX": 14, "topLeftZ": 115, "imageWidth": 480, "imageHeight": 480 },
+    { "image": "f7_boss_s1", "boundsMin": [33, 213, 11], "boundsMax": [113, 255, 86], "widthInWorld": 100, "heightInWorld": 75, "topLeftX": 33, "topLeftZ": 11, "imageWidth": 505, "imageHeight": 480 },
+    { "image": "f7_boss_s2", "boundsMin": [19, 160, -1], "boundsMax": [127, 212, 107], "widthInWorld": 108, "heightInWorld": 108, "topLeftX": 19, "topLeftZ": -1, "imageWidth": 480, "imageHeight": 480 },
+    { "image": "f7_boss_s3", "boundsMin": [-3, 103, 29], "boundsMax": [111, 159, 143], "widthInWorld": 114, "heightInWorld": 114, "topLeftX": -3, "topLeftZ": 29, "renderSize": 64, "imageWidth": 480, "imageHeight": 480 },
+    { "image": "f7_boss_s4", "boundsMin": [-3, 54, 19], "boundsMax": [111, 102, 133], "widthInWorld": 114, "heightInWorld": 94, "topLeftX": -3, "topLeftZ": 19, "imageWidth": 480, "imageHeight": 480 },
+    { "image": "f7_boss_s5", "boundsMin": [-5, 0, -5], "boundsMax": [131, 53, 142], "widthInWorld": 136, "heightInWorld": 147, "topLeftX": -5, "topLeftZ": -5, "imageWidth": 480, "imageHeight": 523 }
+  ]
+}
