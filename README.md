@@ -1,1 +1,1 @@
-Skyblocksimplified
+SkyblockSimplified
