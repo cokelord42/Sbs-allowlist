@@ -129,7 +129,25 @@ public final class WorldScan {
 			int total = Integer.parseInt(m.group(2));
 			int roomTotal = room.data != null ? room.data.getSecrets() : -1;
 			if (roomTotal >= 0 && total != roomTotal) return;
+			// Real bug found while auditing this against Odin's own ActionBarListener.kt (per user request
+			// "make sure im not rate limiting odins websocket"): Hypixel resends this same action-bar line
+			// every single tick the overlay is shown (it's how the health/mana/secrets bar stays on screen at
+			// all), so this method runs dozens of times a second while standing in a room — but this used to
+			// unconditionally reassign room.secretsFound and re-broadcast on EVERY one of those calls, even when
+			// `found` hadn't actually changed. Odin's own equivalent (ActionBarListener.kt line 53) explicitly
+			// guards on `(it.foundSecrets ?: -1) >= updatedFoundSecrets) return` — only a genuine increase fires
+			// its SecretsUpdateEvent/broadcast. Matching that guard here is what actually stops the spam; the
+			// monotonic-max adopt-if-higher logic on the RECEIVE side (DungeonMapSync#onMessage) was already
+			// correct on its own, but did nothing to stop this client's own SEND side from hammering the socket.
+			if (found <= room.secretsFound) return;
 			room.secretsFound = found;
+			// Broadcast this fresh local reading to teammates over Odin's shared relay — matches Odin's own
+			// SecretsUpdateEvent trigger point exactly (see DungeonMapSync's own doc comment).
+			try {
+				DungeonMapSync.send(room);
+			} catch (Exception e) {
+				SkyblockSimplified.LOGGER.error("WorldScan: failed to broadcast room secrets update", e);
+			}
 		} catch (NumberFormatException ignored) {}
 	}
 

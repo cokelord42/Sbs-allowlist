@@ -86,10 +86,15 @@ public final class DungeonChatFilter {
 	// literally the first text in the line, which fails the instant Hypixel prefixes it with anything
 	// (leading whitespace, a stray formatting artifact, etc.) — contains() is a strict superset that still
 	// matches every previously-confirmed case, just without requiring it to be at position 0.
+	// Per user request: "Teleporting to LoBi_Man." (a leap) and " ❣ FarmingLarper is reviving LoBi_Man!".
+	private static final java.util.regex.Pattern TELEPORTING_TO = java.util.regex.Pattern.compile("^Teleporting to \\w{1,16}\\.$");
+	private static final java.util.regex.Pattern REVIVING = java.util.regex.Pattern.compile("^❣ \\w{1,16} is reviving \\w{1,16}!$");
+
 	private static boolean isBlessingMessage(String text) {
 		String lower = text.toLowerCase(java.util.Locale.ROOT);
+		// "A Blessing of Power was picked up!" (per user) joins the found/granted variants.
 		return lower.contains("found a blessing of") || (lower.contains("blessing of") && lower.contains("was found"))
-			|| lower.contains("granted you");
+			|| (lower.contains("blessing of") && lower.contains("was picked up")) || lower.contains("granted you");
 	}
 
 	// Plain text (no §-code requirement, same as every other pattern here) — the exact chat line an
@@ -281,6 +286,12 @@ public final class DungeonChatFilter {
 			DungeonDeclutterFeature dungeonDeclutterEarly = dungeonDeclutter();
 			if (dungeonDeclutterEarly != null && dungeonDeclutterEarly.shouldHideMessage(text)) return false;
 
+			// Per user report ("Autopet hider doesnt trigger on lvl 100 pets"): Autopet's line can arrive as an
+			// action-bar message, which everything below skips — checked here for both. Matched anywhere in the
+			// line so a leading glyph/prefix can't break it.
+			if (declutter != null && declutter.isEnabled() && declutter.isHideAutopet()
+				&& text.replaceAll("§.", "").contains("Autopet equipped your ")) return false;
+
 			if (overlay) return true;
 
 			if (declutter != null && declutter.isEnabled()) {
@@ -304,6 +315,9 @@ public final class DungeonChatFilter {
 				if (declutter.isHideSellMessages() && text.startsWith(SELL_MESSAGE_PREFIX)) return false;
 				if (declutter.isHideHealerOrbMessages() && isHealerOrbMessage(text)) return false;
 				if (declutter.isHideRareReward() && text.startsWith(RARE_REWARD_PREFIX)) return false;
+				if (declutter.isHideTeleporting() && TELEPORTING_TO.matcher(text.strip()).matches()) return false;
+				if (declutter.isHideReviving() && REVIVING.matcher(text.strip()).matches()) return false;
+				if (declutter.isHideWitherEssence() && text.contains("found a Wither Essence! Everyone gains an extra essence!")) return false;
 			}
 
 			return true;

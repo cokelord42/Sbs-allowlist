@@ -14,6 +14,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class SetPlayerTeamPacketMixin {
 	@Inject(method = "handleSetPlayerTeamPacket", at = @At("HEAD"))
 	private void skyblocksimplified$onSetPlayerTeam(ClientboundSetPlayerTeamPacket packet, CallbackInfo ci) {
+		// Vanilla runs this handler twice (network thread, then re-queued on the main thread); only the
+		// main-thread pass is real.
+		if (!net.minecraft.client.Minecraft.getInstance().isSameThread()) return;
 		packet.getParameters().ifPresent(params -> {
 			String text = params.playerPrefix().getString() + params.playerSuffix().getString();
 			LobbyIdTracker.onTeamPrefixSuffix(text);

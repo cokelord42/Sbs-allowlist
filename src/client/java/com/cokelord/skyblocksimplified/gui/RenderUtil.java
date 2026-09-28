@@ -138,34 +138,74 @@ public final class RenderUtil {
 	// no pose-stack flip at blit time at all, so there's no winding order to get culled. Still only a
 	// handful of small NativeImages total (4 per distinct radius/shape/pixelated combo, baked once and
 	// cached), not a per-frame cost.
+	// Real bug found (per user report — "the squircles arent smooth enough. They are more smooth, but i can
+	// still see the antialiasing and pixels"): the analytic coverage functions below (squircleCoverage/
+	// circleCoverage) already evaluate a proper signed-distance-to-coverage falloff — mathematically the same
+	// technique a live fwidth()-based shader smoothstep would use — but this method used to bake exactly ONE
+	// evaluation per DESTINATION pixel (an r×r texture for an r-pixel corner) and blit it 1:1 with nearest
+	// sampling, so the alpha gradient across the ~1-pixel-wide AA band only ever had as many distinct steps as
+	// there are pixel rows/columns crossing it — genuinely coarse at this mod's small UI radii, and worse
+	// still under Minecraft's own GUI Scale option (every "GUI pixel" already maps to several real monitor
+	// pixels before this mod's own rendering even runs, magnifying whatever graininess was already there).
+	// Fixed by supersampling the BAKE (the same analytic functions evaluated on an r*SUPERSAMPLE grid instead
+	// of r — scale-invariant, so this is the exact same shape at higher density, not an approximation of it),
+	// then having the GPU's own LINEAR minification filter (see LinearDynamicTexture) do the averaging down to
+	// the real r×r destination size when this gets blitted — real hardware bilinear resampling across a much
+	// finer analytic gradient, not a bigger single-sample step. Same one-time bake-and-cache cost model as
+	// before (still only a handful of distinct radii in this mod's whole UI), just SUPERSAMPLE² more texels
+	// per bake — negligible at this mod's radii (well under 16px, so at most ~64×64 post-supersample).
+	private static final int SUPERSAMPLE = 4;
+
+	/** {@link net.minecraft.client.renderer.texture.DynamicTexture} always registers its own sampler as
+	 *  NEAREST (confirmed via decompiling the real client jar — no constructor knob to change it), which is
+	 *  exactly right for most of this mod's other baked textures (pixel-exact 1:1 blits) but wrong for
+	 *  {@link #cornerTexture}'s new supersampled bake, which specifically NEEDS bilinear minification to get
+	 *  any benefit from the extra texels. {@code sampler} is {@code protected} on the shared
+	 *  {@code AbstractTexture} base, so a subclass can freely reassign it right after the super constructor
+	 *  finishes setting up the (otherwise identical) texture/view — nothing else in that class ever touches
+	 *  the field again afterward. */
+	private static final class LinearDynamicTexture extends net.minecraft.client.renderer.texture.DynamicTexture {
+		LinearDynamicTexture(java.util.function.Supplier<String> label, com.mojang.blaze3d.platform.NativeImage image) {
+			super(label, image);
+			this.sampler = com.mojang.blaze3d.systems.RenderSystem.getSamplerCache()
+				.getClampToEdge(com.mojang.blaze3d.textures.FilterMode.LINEAR);
+		}
+	}
+
 	private static net.minecraft.resources.Identifier cornerTexture(int r, boolean circle, boolean pixelated, int signX, int signY) {
 		long key = ((long) r << 4) | (circle ? 8 : 0) | (pixelated ? 4 : 0) | (signX > 0 ? 2 : 0) | (signY > 0 ? 1 : 0);
 		net.minecraft.resources.Identifier cached = cornerTextureCache.get(key);
 		if (cached != null) return cached;
 
-		com.mojang.blaze3d.platform.NativeImage image =
-			new com.mojang.blaze3d.platform.NativeImage(com.mojang.blaze3d.platform.NativeImage.Format.RGBA, r, r, false);
-		double cx = r, cy = r;
-		for (int j = 0; j < r; j++) {
-			for (int i = 0; i < r; i++) {
+		// Pixelated masks stay baked at native 1:1 resolution — supersampling a deliberately hard binary
+		// cutoff would just move the same jagged edge to a finer grid before nearest-rounding it right back
+		// down, with no smoothing benefit (that's the whole point of "pixelated"), so there's nothing to gain
+		// from the extra texels there.
+		int bakeSize = pixelated ? r : r * SUPERSAMPLE;
+		com.mojang.blaze3d.platform.NativeImage image = new com.mojang.blaze3d.platform.NativeImage(
+			com.mojang.blaze3d.platform.NativeImage.Format.RGBA, bakeSize, bakeSize, false);
+		double cx = bakeSize, cy = bakeSize;
+		for (int j = 0; j < bakeSize; j++) {
+			for (int i = 0; i < bakeSize; i++) {
 				float coverage;
 				if (pixelated) {
 					if (circle) {
 						double dist = Math.hypot(i + 0.5 - cx, j + 0.5 - cy);
-						coverage = dist <= r ? 1f : 0f;
+						coverage = dist <= bakeSize ? 1f : 0f;
 					} else {
-						double ax = Math.abs(i + 0.5 - cx) / r, ay = Math.abs(j + 0.5 - cy) / r;
+						double ax = Math.abs(i + 0.5 - cx) / bakeSize, ay = Math.abs(j + 0.5 - cy) / bakeSize;
 						coverage = Math.pow(ax, SQUIRCLE_EXPONENT) + Math.pow(ay, SQUIRCLE_EXPONENT) <= 1.0 ? 1f : 0f;
 					}
 				} else {
-					coverage = circle ? circleCoverage(i, j, cx, cy, r) : squircleCoverage(i, j, cx, cy, r);
+					coverage = circle ? circleCoverage(i, j, cx, cy, bakeSize) : squircleCoverage(i, j, cx, cy, bakeSize);
 				}
 				int alpha = Math.round(clamp01(coverage) * 255f);
 				// Canonical (i,j) is computed as if this were the "top-left style" mask (transparent near
-				// local (0,0), solid near local (r-1,r-1)) — writing it to a mirrored destination pixel per
-				// orientation bakes the flip into the texture data itself instead of a render-time transform.
-				int destI = signX > 0 ? i : (r - 1 - i);
-				int destJ = signY > 0 ? j : (r - 1 - j);
+				// local (0,0), solid near local (bakeSize-1,bakeSize-1)) — writing it to a mirrored destination
+				// pixel per orientation bakes the flip into the texture data itself instead of a render-time
+				// transform.
+				int destI = signX > 0 ? i : (bakeSize - 1 - i);
+				int destJ = signY > 0 ? j : (bakeSize - 1 - j);
 				image.setPixelABGR(destI, destJ, (alpha << 24) | 0xFFFFFF);
 			}
 		}
@@ -173,7 +213,8 @@ public final class RenderUtil {
 			"skyblocksimplified", "corner_mask_" + r + "_" + (circle ? "c" : "s") + (pixelated ? "_px" : "")
 				+ "_" + (signX > 0 ? "p" : "n") + (signY > 0 ? "p" : "n"));
 		Minecraft.getInstance().getTextureManager().register(id,
-			new net.minecraft.client.renderer.texture.DynamicTexture(() -> "sbs-corner-mask", image));
+			pixelated ? new net.minecraft.client.renderer.texture.DynamicTexture(() -> "sbs-corner-mask", image)
+				: new LinearDynamicTexture(() -> "sbs-corner-mask", image));
 		cornerTextureCache.put(key, id);
 		return id;
 	}
@@ -190,12 +231,27 @@ public final class RenderUtil {
 			graphics.fill(bx0, by0, bx0 + r, by0 + r, color);
 			return;
 		}
-		// Per user request ("after all this work just revert the squircles back to the pixellated look and
-		// make the pixellated thing default... remove that subtoggle"): no longer a per-user setting — every
-		// rounded corner is drawn with the hard, binary inside/outside cutoff now (see cornerTexture's own
-		// pixelated branch), unconditionally.
-		net.minecraft.resources.Identifier tex = cornerTexture(r, forceCircle, true, signX, signY);
-		graphics.blit(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, tex, bx0, by0, 0f, 0f, r, r, r, r, r, r, color);
+		// Per later user request ("Refactor... to use a custom GLSL fragment shader with SDF and sub-pixel
+		// anti-aliasing... if you think this would be feasible please go ahead and implement it"): investigated
+		// and confirmed a real custom shader pipeline isn't actually needed to get that result — the baked-
+		// texture-per-corner system just above IS already GPU-side (a single cached textured-quad draw call
+		// per corner, zero per-frame math), only ever fed by the hard binary inside/outside cutoff (see
+		// cornerTexture's own pixelated branch) instead of the smooth analytic SDF coverage function that same
+		// method already has right next to it (squircleCoverage/circleCoverage — tuned across several earlier
+		// rounds, then deliberately reverted to pixelated by a later request). Flipping this one flag back to
+		// false restores that already-tuned smooth look at the exact same GPU cost as the pixelated version
+		// (still one cached draw call per corner) — confirmed the right fix after asking the user to choose
+		// between this and an actual from-scratch RenderPipeline/GLSL rewrite (this MC version's real shader
+		// API is the newer blaze3d RenderPipeline/GpuDevice system, not the classic ShaderInstance/.vsh+.fsh
+		// API a from-scratch rewrite would otherwise have had to target blind, with no way to visually verify
+		// it in this environment) — the user chose this lower-risk path.
+		net.minecraft.resources.Identifier tex = cornerTexture(r, forceCircle, false, signX, signY);
+		// Source region + texture size are the SUPERSAMPLED bake size (see cornerTexture's own doc comment),
+		// destination width/height stay the real r×r screen size — this 12-arg blit overload lets those differ,
+		// which is exactly what makes the GPU minify (not just 1:1 copy) the texture, letting its own LINEAR
+		// sampler (see LinearDynamicTexture) do real bilinear averaging across the finer baked gradient.
+		int bakeSize = r * SUPERSAMPLE;
+		graphics.blit(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, tex, bx0, by0, 0f, 0f, r, r, bakeSize, bakeSize, bakeSize, bakeSize, color);
 	}
 
 	// Real bug found (per user report — "the squircles are smooth but not really smooth enough"): 4.0 is
@@ -575,18 +631,18 @@ public final class RenderUtil {
 		graphics.pose().popMatrix();
 	}
 
-	/** A true circle (row-by-row rasterization) — use where something should look like an actual
-	 *  circle (close buttons, knobs), since fillRounded's corner-inset approximation reads as slightly
-	 *  chunky/octagonal at small sizes. */
+	// Real bug found (per user request — "make the dots in the toggles a perfect circle now that we have the
+	// rendering tool for it"): this used to be its own separate, hard-edged per-scanline rasterizer (no
+	// antialiasing at all — each row's own horizontal cross-section was mathematically exact, but the curve
+	// only ever got as many distinct cross-sections as there are rows, the exact "visible staircase" problem
+	// fillRounded's own doc comment already diagnosed and fixed for corners). {@link #fillPill} already IS
+	// the smooth, supersampled-and-cached true-circle path (forceCircle=true, both dimensions equal) — this
+	// now just reshapes a center+radius circle into the x0/y0/x1/y1 box fillPill already expects, instead of
+	// duplicating that whole rendering technique a second time.
+	/** A true circle — use where something should look like an actual circle (close buttons, knobs), since
+	 *  fillRounded's default squircle corners read as flatter-sided at full round. */
 	public static void fillCircle(GuiGraphicsExtractor graphics, int cx, int cy, int radius, int color) {
-		for (int dy = -radius; dy < radius; dy++) {
-			double yMid = dy + 0.5;
-			double halfWidth = Math.sqrt(Math.max(0.0, (double) radius * radius - yMid * yMid));
-			int rowY = cy + dy;
-			int x0 = (int) Math.round(cx - halfWidth);
-			int x1 = (int) Math.round(cx + halfWidth);
-			if (x1 > x0) graphics.fill(x0, rowY, x1, rowY + 1, color);
-		}
+		fillPill(graphics, cx - radius, cy - radius, cx + radius, cy + radius, radius, color);
 	}
 
 	public static float[] rgbToHsv(int argb) {

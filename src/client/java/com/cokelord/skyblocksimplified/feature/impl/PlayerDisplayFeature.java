@@ -479,8 +479,21 @@ public class PlayerDisplayFeature extends Feature {
 		// is suppressing the packet before it ever reaches this method at all.
 		DebugLog.throttled("player_display_setoverlaymessage", 2000L,
 			"Hud#setOverlayMessage called: text=\"" + message.getString() + "\"");
+		// Per user request ("make me a debug that lets me copy my actionbar and ill get it for you so you can
+		// syntax it" — for a future "Show Kuudra Armor's Stacks" element): captured unconditionally, same as
+		// the DebugLog call above, regardless of whether this feature itself is enabled, so
+		// ActionBarCopyDebugFeature's own keybind always has the latest real action-bar text available
+		// (including its raw, un-stripped "§" codes) whenever it's pressed.
+		lastRawActionBar = message.getString();
 		if (instance == null || !instance.isEnabled()) return;
 		instance.onActionBar(message.getString());
+	}
+
+	private static volatile String lastRawActionBar = "";
+
+	/** Used by {@link ActionBarCopyDebugFeature} — see {@link #onOverlayMessage}'s own doc comment. */
+	public static String getLastRawActionBar() {
+		return lastRawActionBar;
 	}
 
 	// Diagnostic evidence for the class doc comment's "Fifth bug found" paragraph, in case some real format

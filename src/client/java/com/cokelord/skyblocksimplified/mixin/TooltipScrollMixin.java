@@ -27,7 +27,7 @@ public class TooltipScrollMixin {
 		at = @At("HEAD")
 	)
 	private void skyblocksimplified$beginTooltipScroll(Font font, List<ClientTooltipComponent> components, int mouseX, int mouseY, ClientTooltipPositioner positioner, Identifier id, CallbackInfo ci) {
-		ScrollableTooltipsFeature.beginTooltip((GuiGraphicsExtractor) (Object) this, font, components);
+		ScrollableTooltipsFeature.beginTooltip((GuiGraphicsExtractor) (Object) this, font, components, mouseX, mouseY, positioner);
 	}
 
 	@Inject(

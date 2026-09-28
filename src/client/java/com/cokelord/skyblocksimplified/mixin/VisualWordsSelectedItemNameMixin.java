@@ -1,6 +1,7 @@
 package com.cokelord.skyblocksimplified.mixin;
 
 import com.cokelord.skyblocksimplified.feature.impl.VisualWordsFeature;
+import com.cokelord.skyblocksimplified.item.MasterStarRevert;
 import net.minecraft.client.gui.Hud;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
@@ -24,6 +25,6 @@ public class VisualWordsSelectedItemNameMixin {
 		at = @At(value = "INVOKE", target = "Lnet/minecraft/world/item/ItemStack;getHoverName()Lnet/minecraft/network/chat/Component;")
 	)
 	private Component skyblocksimplified$rewriteSelectedItemName(ItemStack stack) {
-		return VisualWordsFeature.rewriteIfEnabled(stack.getHoverName());
+		return MasterStarRevert.revertIfEnabled(VisualWordsFeature.rewriteIfEnabled(stack.getHoverName()));
 	}
 }

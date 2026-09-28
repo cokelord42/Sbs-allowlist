@@ -54,6 +54,14 @@ public class ChatDeclutterFeature extends Feature {
 	// regardless of which player/item/chest tier triggered it, so a plain prefix match (same convention as
 	// hideSellMessages) covers every real variant.
 	private boolean hideRareReward = false;
+	// Per user request: "Teleporting to <name>." (leaps), "❣ <name> is reviving <name>!", and Autopet's
+	// "Autopet equipped your [Lvl 200] Golden Dragon! VIEW RULE".
+	private boolean hideTeleporting = false;
+	private boolean hideReviving = false;
+	private boolean hideAutopet = false;
+	// Per user request: "<name> found a Wither Essence! Everyone gains an extra essence!" and the local
+	// "You found a Wither Essence! ..." variant.
+	private boolean hideWitherEssence = false;
 
 	public ChatDeclutterFeature() {
 		super("chat_declutter", "Chat De-clutter", FeatureCategory.INVENTORY, false);
@@ -115,6 +123,16 @@ public class ChatDeclutterFeature extends Feature {
 	public boolean isHideHealerOrbMessages() { return hideHealerOrbMessages; }
 	public void setHideHealerOrbMessages(boolean v) { hideHealerOrbMessages = v; }
 
+	public boolean isHideTeleporting() { return hideTeleporting; }
+	public void setHideTeleporting(boolean v) { hideTeleporting = v; }
+	public boolean isHideReviving() { return hideReviving; }
+	public void setHideReviving(boolean v) { hideReviving = v; }
+	public boolean isHideAutopet() { return hideAutopet; }
+	public void setHideAutopet(boolean v) { hideAutopet = v; }
+
+	public boolean isHideWitherEssence() { return hideWitherEssence; }
+	public void setHideWitherEssence(boolean v) { hideWitherEssence = v; }
+
 	public boolean isHideRareReward() { return hideRareReward; }
 	public void setHideRareReward(boolean v) { hideRareReward = v; }
 
@@ -139,6 +157,10 @@ public class ChatDeclutterFeature extends Feature {
 		obj.addProperty("hideSellMessages", hideSellMessages);
 		obj.addProperty("hideHealerOrbMessages", hideHealerOrbMessages);
 		obj.addProperty("hideRareReward", hideRareReward);
+		obj.addProperty("hideTeleporting", hideTeleporting);
+		obj.addProperty("hideReviving", hideReviving);
+		obj.addProperty("hideAutopet", hideAutopet);
+		obj.addProperty("hideWitherEssence", hideWitherEssence);
 		return obj;
 	}
 
@@ -164,6 +186,10 @@ public class ChatDeclutterFeature extends Feature {
 		if (obj.has("hideSellMessages")) hideSellMessages = obj.get("hideSellMessages").getAsBoolean();
 		if (obj.has("hideHealerOrbMessages")) hideHealerOrbMessages = obj.get("hideHealerOrbMessages").getAsBoolean();
 		if (obj.has("hideRareReward")) hideRareReward = obj.get("hideRareReward").getAsBoolean();
+		if (obj.has("hideTeleporting")) hideTeleporting = obj.get("hideTeleporting").getAsBoolean();
+		if (obj.has("hideReviving")) hideReviving = obj.get("hideReviving").getAsBoolean();
+		if (obj.has("hideAutopet")) hideAutopet = obj.get("hideAutopet").getAsBoolean();
+		if (obj.has("hideWitherEssence")) hideWitherEssence = obj.get("hideWitherEssence").getAsBoolean();
 	}
 
 	@Override

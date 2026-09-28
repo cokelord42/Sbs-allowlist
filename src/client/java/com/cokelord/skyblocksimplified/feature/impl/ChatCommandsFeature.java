@@ -113,6 +113,13 @@ public class ChatCommandsFeature extends Feature {
 	private boolean reinvite = false;
 	private boolean ping = true;
 	private boolean fps = true;
+	// Per user request ("Add the !tps chat command since it currently doesnt exist"): same shape as !fps
+	// above, just reading TpsMonitor's existing best-effort server-TPS estimate instead of the client's own
+	// real FPS counter — see NetworkDisplayFeature's own class doc comment for why that estimate (not a real
+	// Hypixel-sent value, which doesn't exist) is this codebase's one established TPS source.
+	private boolean tps = true;
+	// Per user request: SBO's Diana party commands (!chim, !inq, !since ..., !stats <name>) — see DianaPartyCommands.
+	private boolean dianaCommands = true;
 	private boolean dt = true;
 	private boolean invite = true;
 	private boolean autoConfirm = false;
@@ -247,6 +254,9 @@ public class ChatCommandsFeature extends Feature {
 			}
 		}
 
+		// Odin's regex first; the tolerant parser below only runs for lines it didn't recognise.
+		if (tryOdinParse(text.replaceAll("§.", ""))) return;
+
 		ChatChannel channel;
 		String rest;
 		// Only requires the marker to appear near the very start of the line (allowing for a stray leading
@@ -321,24 +331,67 @@ public class ChatCommandsFeature extends Feature {
 			return;
 		}
 		if (msg.isEmpty() || !msg.startsWith("!")) return;
+		dispatchLater(msg, ign, channel);
+	}
 
-		// Per user report ("chat commands gives me this debug line but doesnt seem to do anything," posted
-		// again after this exact call chain was independently confirmed correct on paper against their own
-		// captured line, gates included — partyLeader/isLeader/queInstance all checked out): the OUTER
-		// listener registration already wraps onChatLine in a try/catch, but it only logs to the game's log
-		// file (SkyblockSimplified.LOGGER), which the user has never been shown to have open — an exception
-		// thrown anywhere inside handleChatCommand (a bad sendCommand call, an NPE, anything) would be
-		// completely invisible to them: no chat message, no obvious error, exactly the reported symptom.
-		// Catching here too and echoing the exception straight into the user's own chat makes a real failure
-		// impossible to miss on the next attempt, instead of silently vanishing into a log file nobody's
-		// watching.
-		try {
-			handleChatCommand(msg, ign, channel);
-		} catch (Exception e) {
-			chatMessage("§c[ChatCommands] " + msg + " failed: " + e);
-			com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("ChatCommandsFeature failed handling \"" + msg + "\"", e);
+	// Per user report ("Chat commands are still not working. Check odin detection. Doesnt work in party"),
+	// matched to Odin's ChatCommands.kt: commands run 4 ticks AFTER the line arrives (Odin: schedule(4)), never
+	// inside the chat-receive callback. Replying synchronously while the incoming (signed) party line is
+	// still being processed sends our command's "last seen messages" acknowledgement out of step, which the
+	// server can silently reject — so the reply never appeared.
+	private static final int COMMAND_DELAY_TICKS = 4;
+	private record PendingCommand(String msg, String name, ChatChannel channel, long runAtTick) {}
+	private final java.util.ArrayDeque<PendingCommand> pendingCommands = new java.util.ArrayDeque<>();
+	private long clientTicks = 0;
+	private static boolean tickHookRegistered = false;
+
+	private void dispatchLater(String msg, String name, ChatChannel channel) {
+		pendingCommands.addLast(new PendingCommand(msg, name, channel, clientTicks + COMMAND_DELAY_TICKS));
+		if (!tickHookRegistered) {
+			tickHookRegistered = true;
+			net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK.register(client -> {
+				if (instance != null) instance.runPendingCommands();
+			});
 		}
 	}
+
+	private void runPendingCommands() {
+		clientTicks++;
+		while (!pendingCommands.isEmpty() && pendingCommands.peekFirst().runAtTick() <= clientTicks) {
+			PendingCommand cmd = pendingCommands.pollFirst();
+			try {
+				handleChatCommand(cmd.msg(), cmd.name(), cmd.channel());
+			} catch (Exception e) {
+				chatMessage("§c[ChatCommands] " + cmd.msg() + " failed: " + e);
+				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("ChatCommandsFeature failed handling \"" + cmd.msg() + "\"", e);
+			}
+		}
+	}
+
+	// Odin's exact channel regex (ChatCommands.kt messageRegex), tried first on the color-stripped line.
+	private static final Pattern ODIN_MESSAGE = Pattern.compile(
+		"^(?:Party > (\\[[^]]*?])? ?(\\w{1,16})(?: [ቾ⚒])?: ?(.+)$|Guild > (\\[[^]]*?])? ?(\\w{1,16})(?: \\[([^]]*?)])?: ?(.+)$|From (\\[[^]]*?])? ?(\\w{1,16}): ?(.+)$)");
+
+	/** @return true when Odin's regex recognised the line (handled or deliberately ignored). */
+	private boolean tryOdinParse(String text) {
+		java.util.regex.Matcher m = ODIN_MESSAGE.matcher(text);
+		if (!m.find()) return false;
+		String prefix = m.group().split(" ")[0];
+		ChatChannel channel;
+		switch (prefix) {
+			case "Party" -> { if (!partyChatCommands) return true; channel = ChatChannel.PARTY; }
+			case "Guild" -> { if (!guildChatCommands) return true; channel = ChatChannel.GUILD; }
+			case "From" -> { if (!privateChatCommands) return true; channel = ChatChannel.PRIVATE; }
+			default -> { return false; }
+		}
+		String ign = m.group(2) != null ? m.group(2) : m.group(5) != null ? m.group(5) : m.group(9);
+		String msg = m.group(3) != null ? m.group(3) : m.group(7) != null ? m.group(7) : m.group(10);
+		if (ign == null || msg == null) return true;
+		msg = msg.trim();
+		if (msg.startsWith("!")) dispatchLater(msg, ign, channel);
+		return true;
+	}
+
 
 	/** Picks the username out of a "[500✫] [MVP+] Name" style blob — the last whitespace-separated token
 	 *  that's a bare valid Minecraft username, since every rank/level tag is bracketed and the real name
@@ -367,6 +420,8 @@ public class ChatCommandsFeature extends Feature {
 			case "racism" -> { if (racism) channelMessage(name + " is " + (1 + (int) (Math.random() * 100)) + "% racist. Racism is not allowed!", name, channel); }
 			case "ping" -> { if (ping) channelMessage("Current Ping: " + currentPing() + "ms", name, channel); }
 			case "fps" -> { if (this.fps) channelMessage("Current FPS: " + Minecraft.getInstance().getFps(), name, channel); }
+			case "tps" -> { if (this.tps) channelMessage("TPS: " + String.format(java.util.Locale.ROOT, "%.1f",
+				com.cokelord.skyblocksimplified.util.TpsMonitor.getEstimatedTps()), name, channel); }
 			case "time" -> { if (time) channelMessage("Current Time: " + ZonedDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z")), name, channel); }
 			case "location" -> { if (location) channelMessage("Current Location: " + currentLocationName(), name, channel); }
 			case "holding" -> { if (holding) channelMessage("Holding: " + holdingItemName(), name, channel); }
@@ -381,16 +436,27 @@ public class ChatCommandsFeature extends Feature {
 
 			case "downtime", "dt" -> {
 				if (!dt || channel != ChatChannel.PARTY) return;
-				String reason = words.length > 1 ? String.join(" ", java.util.Arrays.copyOfRange(words, 1, words.length)).trim() : "";
-				if (reason.isEmpty()) reason = "No reason given";
+				// Reason keeps its original casing (words[] is lowercased for command matching).
+				int space = message.indexOf(' ');
+				String givenReason = space > 0 ? message.substring(space + 1).trim() : "";
+				String reason = givenReason.isEmpty() ? "No reason given" : givenReason;
 				if (dtReasons.stream().anyMatch(e -> e.getKey().equals(name))) { chatMessage("§6" + name + " §calready has a reminder!"); return; }
 				chatMessage("§aReminder set for the end of the run! §7(disabled auto requeue for this run)");
 				dtReasons.add(Map.entry(name, reason));
 				DungeonQueueFeature dq = dungeonQueueFeature();
 				if (dq != null) dq.setDisableRequeue(true);
-				// Per user request ("if the local player is party leader, show a title on screen") — additive
-				// to the reminder-queue behavior above, not a replacement for it.
-				if (PartyApi.isLeader()) DungeonNotificationsFeature.fireDowntimeRequest(name, reason);
+				// Per user request: always title "<name> needs dt!", or "<name> <reason>" when one is given
+				// ("!dt need arrows" -> "<name> need arrows"). Goes through Dungeon Notifications' Downtime
+				// Request type when that's on (its title/sound/color settings), else a plain vanilla title.
+				String dtTitle = givenReason.isEmpty() ? name + " needs dt!" : name + " " + givenReason;
+				if (!DungeonNotificationsFeature.fireDowntimeRequest(name, dtTitle)) {
+					Minecraft mc = Minecraft.getInstance();
+					if (mc.player != null) {
+						mc.gui.hud.setTimes(5, 50, 10);
+						mc.gui.hud.setTitle(net.minecraft.network.chat.Component.literal("§c" + dtTitle));
+						mc.player.playSound(net.minecraft.sounds.SoundEvents.NOTE_BLOCK_PLING.value(), 1f, 1f);
+					}
+				}
 			}
 			case "undowntime", "undt" -> {
 				if (!dt || channel != ChatChannel.PARTY) return;
@@ -438,7 +504,13 @@ public class ChatCommandsFeature extends Feature {
 					mc.player.playSound(SoundEvents.NOTE_BLOCK_PLING.value(), 1f, 1f);
 				}
 			}
-			default -> {}
+			default -> {
+				if (!dianaCommands || channel != ChatChannel.PARTY) return;
+				Minecraft mc = Minecraft.getInstance();
+				String self = mc.player != null ? mc.player.getGameProfile().name() : "";
+				String reply = com.cokelord.skyblocksimplified.diana.DianaPartyCommands.respond(command, arg, self);
+				if (reply != null) channelMessage(reply, name, channel);
+			}
 		}
 	}
 
@@ -536,7 +608,10 @@ public class ChatCommandsFeature extends Feature {
 
 	private static void sendCommand(String command) {
 		Minecraft mc = Minecraft.getInstance();
-		if (mc.player != null && mc.player.connection != null) mc.player.connection.sendCommand(command);
+		// Queued onto the main loop like Odin's sendCommand, never sent mid-packet-handling.
+		mc.execute(() -> {
+			if (mc.player != null && mc.player.connection != null) mc.player.connection.sendCommand(command);
+		});
 	}
 
 	private void chatMessage(String message) {
@@ -675,6 +750,10 @@ public class ChatCommandsFeature extends Feature {
 	public void setPing(boolean value) { ping = value; }
 	public boolean isFps() { return fps; }
 	public void setFps(boolean value) { fps = value; }
+	public boolean isTps() { return tps; }
+	public boolean isDianaCommands() { return dianaCommands; }
+	public void setDianaCommands(boolean value) { dianaCommands = value; }
+	public void setTps(boolean value) { tps = value; }
 	public boolean isDt() { return dt; }
 	public void setDt(boolean value) { dt = value; }
 	public boolean isInvite() { return invite; }
@@ -717,6 +796,8 @@ public class ChatCommandsFeature extends Feature {
 		obj.addProperty("reinvite", reinvite);
 		obj.addProperty("ping", ping);
 		obj.addProperty("fps", fps);
+		obj.addProperty("tps", tps);
+		obj.addProperty("dianaCommands", dianaCommands);
 		obj.addProperty("dt", dt);
 		obj.addProperty("invite", invite);
 		obj.addProperty("autoConfirm", autoConfirm);
@@ -751,6 +832,8 @@ public class ChatCommandsFeature extends Feature {
 		if (obj.has("reinvite")) reinvite = obj.get("reinvite").getAsBoolean();
 		if (obj.has("ping")) ping = obj.get("ping").getAsBoolean();
 		if (obj.has("fps")) fps = obj.get("fps").getAsBoolean();
+		if (obj.has("tps")) tps = obj.get("tps").getAsBoolean();
+		if (obj.has("dianaCommands")) dianaCommands = obj.get("dianaCommands").getAsBoolean();
 		if (obj.has("dt")) dt = obj.get("dt").getAsBoolean();
 		if (obj.has("invite")) invite = obj.get("invite").getAsBoolean();
 		if (obj.has("autoConfirm")) autoConfirm = obj.get("autoConfirm").getAsBoolean();

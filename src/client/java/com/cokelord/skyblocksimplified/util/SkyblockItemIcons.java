@@ -159,6 +159,18 @@ public final class SkyblockItemIcons {
 		entry("LOG", "oak_log"), entry("LOG_2", "acacia_log"), entry("MONSTER_EGG", "pig_spawn_egg")
 	);
 
+	private static final Identifier MISSING_MODEL_PROBE = Identifier.fromNamespaceAndPath("skyblocksimplified", "missing_model_probe");
+
+	/** ModelManager returns its shared "missing" model for unknown ids, so compare against a known-absent id. */
+	private static boolean itemModelExists(Identifier modelId) {
+		try {
+			var models = net.minecraft.client.Minecraft.getInstance().getModelManager();
+			return models.getItemModel(modelId) != models.getItemModel(MISSING_MODEL_PROBE);
+		} catch (Exception e) {
+			return true;
+		}
+	}
+
 	private static ItemStack resolve(String skyblockId) {
 		SkyblockItemRepo.ItemInfo info = SkyblockItemRepo.getItem(skyblockId);
 		if (info == null) return null;
@@ -172,9 +184,24 @@ public final class SkyblockItemIcons {
 		// same way the game already renders it everywhere else. Checked BEFORE skinTexture/material: an
 		// item using this system carries no "skin" object at all, and its "material" is just an
 		// irrelevant bare carrier (almost always PAPER) once this override is applied.
-		if (info.itemModel() != null) {
+		// Per user report ("The ender pearl icon in inventory buttons is still a paper"): only a PAPER-carried
+		// item is a pure model reskin; when the material is a real vanilla item (ENDER_PEARL etc.), render
+		// that item directly instead of trusting a model override that may resolve to the paper carrier.
+		Item materialItem = null;
+		if (info.material() != null) {
+			String mat = info.material().toUpperCase(Locale.ROOT);
+			Identifier matId = Identifier.tryParse("minecraft:" + LEGACY_MATERIAL_ALIASES.getOrDefault(mat, mat.toLowerCase(Locale.ROOT)));
+			materialItem = matId != null ? BuiltInRegistries.ITEM.getOptional(matId).orElse(null) : null;
+		}
+		boolean realVanillaMaterial = materialItem != null && materialItem != Items.AIR && materialItem != Items.PAPER
+			&& materialItem != Items.PLAYER_HEAD && info.skinTexture() == null;
+		if (info.itemModel() != null && !realVanillaMaterial) {
 			Identifier modelId = Identifier.tryParse(info.itemModel());
-			if (modelId != null) {
+			// Per user report ("Some inventory buttons show papers, specifically ... the ender pearl item"):
+			// the model id only exists while Hypixel's resource pack is loaded (Remove SkyBlock Texture Pack,
+			// or a declined pack, leaves it missing), and a missing model renders the bare PAPER carrier. Only
+			// use the override when the model really exists; otherwise fall through to skin/material.
+			if (modelId != null && itemModelExists(modelId)) {
 				ItemStack stack = new ItemStack(Items.PAPER);
 				stack.set(net.minecraft.core.component.DataComponents.ITEM_MODEL, modelId);
 				return stack;

@@ -90,78 +90,81 @@ public class StarredMobHighlightFeature extends MobHighlightFeature {
 	public void onTick(Minecraft client) {
 		if (client.level == null || !DungeonState.isInDungeon() || DungeonState.isInBoss()) return;
 
+		// Real cost found: these used to be two separate `entitiesForRendering()` passes — one filtering FOR
+		// ArmorStand, one filtering it OUT — which are mutually exclusive on the exact same `instanceof
+		// ArmorStand` check, so every entity in render distance was being walked twice per tick for no reason.
+		// Merged into one pass with an if/else on that same check — same entities visited, same logic and
+		// order within each branch, half the list traversal.
 		for (Entity e : client.level.entitiesForRendering()) {
 			if (!e.isAlive()) continue;
 
-			// Per explicit user request ("Remove all fixes to highlighting the fel heads, since im starting
-			// to think thats not actually allowed"): the last several rounds' attempts at highlighting a
-			// separate "resting/inactive Fels head" state (first an ArmorStand+skull-texture guess, then a
-			// nameless-EnderMan-entity-type guess) are removed entirely — back to only ever highlighting the
-			// STARRED/awakened variant below, exactly matching Odin/SkyHanni/devonian's own confirmed real
-			// behavior with zero special-casing for Fels specifically.
-			if (!(e instanceof ArmorStand)) continue;
-			ArmorStand stand = (ArmorStand) e;
-			trackedEntities.remove(stand);
+			if (e instanceof ArmorStand stand) {
+				// Per explicit user request ("Remove all fixes to highlighting the fel heads, since im starting
+				// to think thats not actually allowed"): the last several rounds' attempts at highlighting a
+				// separate "resting/inactive Fels head" state (first an ArmorStand+skull-texture guess, then a
+				// nameless-EnderMan-entity-type guess) are removed entirely — back to only ever highlighting the
+				// STARRED/awakened variant below, exactly matching Odin/SkyHanni/devonian's own confirmed real
+				// behavior with zero special-casing for Fels specifically.
+				trackedEntities.remove(stand);
 
-			String name = stand.getName().getString();
-			if (DUNGEON_MOB_SPAWN_NAMES.stream().noneMatch(name::contains)) continue;
+				String name = stand.getName().getString();
+				if (DUNGEON_MOB_SPAWN_NAMES.stream().noneMatch(name::contains)) continue;
 
-			boolean isStarred = STARRED_PATTERN.matcher(name).matches();
-			boolean allowInvisibleShadowAssassin = name.contains("Shadow Assassin");
+				boolean isStarred = STARRED_PATTERN.matcher(name).matches();
+				boolean allowInvisibleShadowAssassin = name.contains("Shadow Assassin");
 
-			if (hideNonStarredNames && stand.isInvisible() && !isStarred) stand.setCustomNameVisible(false);
+				if (hideNonStarredNames && stand.isInvisible() && !isStarred) stand.setCustomNameVisible(false);
 
-			// Real bug found (per user report — "shadow assassins still dont get highlighted", TWICE now
-			// after the equipment-fingerprint fix): this whole search+highlight block used to be gated on
-			// `isStarred` alone — a plain (non-elite) Shadow Assassin, which is what actually spawns in normal
-			// rooms most of the time, would never even reach the search below at all, regardless of whether
-			// the equipment check itself was correct. Invisibility is inherent to the MOB TYPE here, not just
-			// its starred variant, so Shadow Assassin now bypasses the isStarred gate entirely — every other
-			// mob type keeps the original starred-only behavior.
-			if (isStarred || allowInvisibleShadowAssassin) {
-				if (isStarred && hideStarredNames) stand.setCustomNameVisible(false);
-				// Real bug found (per user report — "every single starred mob head is highlighted on top of
-				// their regular highlight"): a previous round unconditionally added the nametag stand itself
-				// to trackedEntities for EVERY dungeon mob type here, not just Fels — Odin's own real
-				// Highlight.kt (confirmed source) never highlights the stand at all, only the real mob found
-				// below it, so this was a straight regression for every non-Fel mob (double highlight: the
-				// invisible stand's own outline stacked on the real mob's).
-				AABB searchBox = stand.getBoundingBox().move(0, -1.0, 0);
-				Entity realMob = null;
-				for (Entity candidate : client.level.getEntities(stand, searchBox, target -> isValidTarget(target, allowInvisibleShadowAssassin))) {
-					realMob = candidate;
-					break;
+				// Real bug found (per user report — "shadow assassins still dont get highlighted", TWICE now
+				// after the equipment-fingerprint fix): this whole search+highlight block used to be gated on
+				// `isStarred` alone — a plain (non-elite) Shadow Assassin, which is what actually spawns in normal
+				// rooms most of the time, would never even reach the search below at all, regardless of whether
+				// the equipment check itself was correct. Invisibility is inherent to the MOB TYPE here, not just
+				// its starred variant, so Shadow Assassin now bypasses the isStarred gate entirely — every other
+				// mob type keeps the original starred-only behavior.
+				if (isStarred || allowInvisibleShadowAssassin) {
+					if (isStarred && hideStarredNames) stand.setCustomNameVisible(false);
+					// Real bug found (per user report — "every single starred mob head is highlighted on top of
+					// their regular highlight"): a previous round unconditionally added the nametag stand itself
+					// to trackedEntities for EVERY dungeon mob type here, not just Fels — Odin's own real
+					// Highlight.kt (confirmed source) never highlights the stand at all, only the real mob found
+					// below it, so this was a straight regression for every non-Fel mob (double highlight: the
+					// invisible stand's own outline stacked on the real mob's).
+					AABB searchBox = stand.getBoundingBox().move(0, -1.0, 0);
+					Entity realMob = null;
+					for (Entity candidate : client.level.getEntities(stand, searchBox, target -> isValidTarget(target, allowInvisibleShadowAssassin))) {
+						realMob = candidate;
+						break;
+					}
+					// Per user request ("I want the highlighted starred mobs to hide when not in their room if
+					// possible"): only keep tracking the real mob while the player is standing in the SAME
+					// dungeon room it's in.
+					if (realMob != null && shouldShowInCurrentRoom(realMob)) trackedEntities.add(realMob);
 				}
-				// Per user request ("I want the highlighted starred mobs to hide when not in their room if
-				// possible"): only keep tracking the real mob while the player is standing in the SAME
-				// dungeon room it's in.
-				if (realMob != null && shouldShowInCurrentRoom(realMob)) trackedEntities.add(realMob);
+			} else {
+				// Real bug found (per user report — "shadow assassins are starred mobs but the star doesnt show
+				// up until visible because they are invisible and have no nametags"): the ENTIRE mechanism above
+				// requires finding a real ArmorStand nametag stand first, matched by name, before it ever looks
+				// for the real mob underneath — but per the user's own clarification, a genuinely stealthed
+				// Shadow Assassin has no nametag stand to find AT ALL while invisible (that's why it was only
+				// ever getting highlighted once it un-stealthed and a real nametag appeared). This branch is a
+				// fully independent scan for the same boots-only equipment fingerprint, with zero dependency on
+				// any nametag — the only signal that can actually catch one while it's still stealthed.
+				//
+				// Real bug found AGAIN (per user report — "still dont get highlighted until they are no longer
+				// invisible" — after the above independent scan was already live): this used to blanket-exclude
+				// every `Player` instance, but Hypixel reskins several humanoid dungeon mobs (Shadow Assassin
+				// included) as fake NPC players — exactly the same real UUID-version-2 fake-player entity
+				// `isValidTarget` above already special-cases for the visible/nametag path. Blanket-excluding
+				// Player here meant a Shadow Assassin implemented as one of these fake players could never be
+				// caught by this scan at all, no matter how correct the equipment fingerprint was — only a REAL
+				// player (the local player, or any other real UUID-version-4 player) should ever be excluded.
+				if (!e.isInvisible()) continue;
+				if (e instanceof Player player && (player == client.player || player.getUUID().version() != 2)) continue;
+				if (trackedEntities.contains(e)) continue;
+				if (!isLikelyShadowAssassin(e)) continue;
+				if (shouldShowInCurrentRoom(e)) trackedEntities.add(e);
 			}
-		}
-
-		// Real bug found (per user report — "shadow assassins are starred mobs but the star doesnt show up
-		// until visible because they are invisible and have no nametags"): the ENTIRE mechanism above
-		// requires finding a real ArmorStand nametag stand first, matched by name, before it ever looks for
-		// the real mob underneath — but per the user's own clarification, a genuinely stealthed Shadow
-		// Assassin has no nametag stand to find AT ALL while invisible (that's why it was only ever getting
-		// highlighted once it un-stealthed and a real nametag appeared). This is a fully independent scan of
-		// every entity for the same boots-only equipment fingerprint, with zero dependency on any nametag —
-		// the only signal that can actually catch one while it's still stealthed.
-		//
-		// Real bug found AGAIN (per user report — "still dont get highlighted until they are no longer
-		// invisible" — after the above independent scan was already live): this loop blanket-excluded every
-		// `Player` instance, but Hypixel reskins several humanoid dungeon mobs (Shadow Assassin included) as
-		// fake NPC players — exactly the same real UUID-version-2 fake-player entity `isValidTarget` above
-		// already special-cases for the visible/nametag path. Blanket-excluding Player here meant a Shadow
-		// Assassin implemented as one of these fake players could never be caught by this scan at all, no
-		// matter how correct the equipment fingerprint was — only a REAL player (the local player, or any
-		// other real UUID-version-4 player) should ever be excluded.
-		for (Entity e : client.level.entitiesForRendering()) {
-			if (!e.isAlive() || !e.isInvisible() || e instanceof ArmorStand) continue;
-			if (e instanceof Player player && (player == client.player || player.getUUID().version() != 2)) continue;
-			if (trackedEntities.contains(e)) continue;
-			if (!isLikelyShadowAssassin(e)) continue;
-			if (shouldShowInCurrentRoom(e)) trackedEntities.add(e);
 		}
 		trackedEntities.removeIf(e -> !e.isAlive() || !shouldShowInCurrentRoom(e));
 	}

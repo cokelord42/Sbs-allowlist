@@ -201,6 +201,13 @@ public class ItemRarityBackgroundFeature extends Feature {
 		return combinedRarityColorOf(stack);
 	}
 
+	/** Fills with an already-resolved rarity color (see {@link #rarityColorPublic}) — for callers that cache
+	 *  the color per stack themselves (the Player Viewer draws hundreds of static slots per frame). */
+	public static void fillSlotColor(GuiGraphicsExtractor graphics, int x, int y, Integer color) {
+		if (instance == null || !instance.isEnabled() || color == null) return;
+		instance.fillSlot(graphics, x, y, color);
+	}
+
 	public static Shape getGlobalShape() { return instance != null ? instance.shape : Shape.SQUARE; }
 
 	private void fillSlot(GuiGraphicsExtractor graphics, int x, int y, int rgb) {
@@ -276,21 +283,46 @@ public class ItemRarityBackgroundFeature extends Feature {
 	 *  rarity, and that used to be the run this method returned (or nothing at all, if that particular dye
 	 *  color happened not to be a real rarity color, which is the common case). Fixed by never returning
 	 *  present from the visitor at all (so the traversal always runs to completion over every leaf) and
-	 *  instead recording the first leaf color that's actually a MEMBER of {@link #RARITY_NAME_COLORS} — a
-	 *  decorative prefix's dye color essentially never coincidentally matches one of the 9 fixed rarity RGBs,
-	 *  so the real rarity-colored run (always present somewhere in the name) is still found correctly. */
+	 *  instead recording a leaf color that's actually a MEMBER of {@link #RARITY_NAME_COLORS} — a decorative
+	 *  prefix's dye color essentially never coincidentally matches one of the 9 fixed rarity RGBs, so the real
+	 *  rarity-colored run (always present somewhere in the name) is still found correctly.
+	 *
+	 *  <p>Real bug found (per user report — "the item rarity background doesnt capture the rift necklace since
+	 *  it starts with golden text"): unlike a dye color, the Rift Necklace's own decorative name PREFIX is
+	 *  itself colored exactly gold (0xFFAA00) — the same real fixed RGB {@link #RARITY_NAME_COLORS} uses for
+	 *  LEGENDARY — so the dye fix's own "first match found wins" rule kept latching onto that prefix instead of
+	 *  the item's real (non-Legendary) rarity color later in the same name, and the lore+name AND-check in
+	 *  {@link #combinedRarityColorOf} then never agreed. Kept updating {@code found} through the WHOLE walk
+	 *  instead of keeping only the first hit, so the LAST rarity-colored run wins — Hypixel always colors the
+	 *  bulk of an item's real name (everything after any short decorative prefix glyph) in its actual rarity
+	 *  color, so the last matching run is the reliable one, not the first. */
 	private static Integer nameColorOf(ItemStack stack) {
-		Component name = stack.getHoverName();
-		java.util.concurrent.atomic.AtomicReference<Integer> found = new java.util.concurrent.atomic.AtomicReference<>();
-		name.visit((style, text) -> {
-			if (!text.isEmpty() && style.getColor() != null) {
+		// Per user report ("Skinned pets get a custom rarity since the star is colored differently. Make it
+		// prioritize the regular rarities (common->mythic) when it finds multiple colors"): "last rarity-
+		// colored run wins" picked a skinned pet's colored star. Now counts the visible characters per
+		// rarity color: a regular rarity (Common..Mythic) always beats Divine/Special/Supreme, and within
+		// the same group the color covering the most text wins, so a one-glyph star or prefix can't.
+		java.util.Map<Integer, Integer> charsByColor = new java.util.HashMap<>();
+		stack.getHoverName().visit((style, text) -> {
+			if (style.getColor() != null) {
 				int color = style.getColor().getValue();
-				if (RARITY_NAME_COLORS.contains(color)) found.compareAndSet(null, color);
+				int visible = text.strip().length();
+				if (visible > 0 && RARITY_NAME_COLORS.contains(color)) charsByColor.merge(color, visible, Integer::sum);
 			}
 			return java.util.Optional.<Integer>empty();
 		}, Style.EMPTY);
-		return found.get();
+		Integer best = null;
+		int bestScore = -1;
+		for (var e : charsByColor.entrySet()) {
+			int score = (REGULAR_RARITY_COLORS.contains(e.getKey()) ? 1_000_000 : 0) + e.getValue();
+			if (score > bestScore) { bestScore = score; best = e.getKey(); }
+		}
+		return best;
 	}
+
+	/** Common, Uncommon, Rare, Epic, Legendary, Mythic — preferred over the rarer tiers in {@link #nameColorOf}. */
+	private static final java.util.Set<Integer> REGULAR_RARITY_COLORS = java.util.Set.of(
+		0xFFFFFF, 0x55FF55, 0x5555FF, 0xAA00AA, 0xFFAA00, 0xFF55FF);
 
 	/** The rarity tier's own fixed color, if the item's lore contains a real Hypixel rarity word anywhere
 	 *  (scanned backward from the last non-blank line, matching real event/menu items whose rarity tag isn't
@@ -309,22 +341,40 @@ public class ItemRarityBackgroundFeature extends Feature {
 		return null;
 	}
 
-	/** Real design correction (per user report — "i need you to scan both names and lore text. Only if both
-	 *  match the same rarity (i.e, lore says uncommon and the item name is green) should it show the
-	 *  background, to make sure stuff that has the words in the lore dont get rarity backgrounded if they
-	 *  dont match the name color"): neither signal alone is reliable — a rarity WORD anywhere in an item's
-	 *  lore doesn't mean the item itself has that rarity (menu/event items can mention "Common"/"Rare" in a
-	 *  description sentence with no structural connection to their own real rarity), and a name merely
-	 *  colored the same as a rarity tier doesn't confirm it's actually a rarity item either. Requiring BOTH
-	 *  to agree on the exact same tier is what actually confirms "this is genuinely a rarity item" — this is
-	 *  now safe to scan the whole lore permissively again (see loreRarityColorOf's own doc comment) since a
-	 *  false-positive lore word can no longer paint anything on its own; it still needs the name color to
-	 *  independently agree. */
+	/** Real bug found (per user report — "my soulweaver gloves dont show any rarity even though its epic and
+	 *  it has epic colored name text. Same with my terminator and hyperion... it only finds the stars color
+	 *  currently and thinks that doesnt match the mythic rarity"): {@link #nameColorOf} picks exactly ONE
+	 *  "the" name color (the LAST rarity-palette-matching run, per that method's own doc comment) and this used
+	 *  to require it to equal the lore color exactly — but Revert Master Stars repaints a dungeon item's
+	 *  trailing star run in a FIXED red/gold (0xFF5555/0xFFAA00, see {@link com.cokelord.skyblocksimplified.item.MasterStarRevert#revert})
+	 *  that has nothing to do with the item's actual rarity and, for a Mythic/Divine/etc. item, never matches
+	 *  it — since that star run sits at the very END of the name, "last match wins" now reliably picks IT
+	 *  instead of the item's real rarity-colored name text before it, the same class of collision the Rift
+	 *  Necklace bug was, just from the other direction. Per user's own fix ("Make it search for ANY
+	 *  resemblance. If the item name contains the rarity color at all it should render the rarity it says in
+	 *  the lore"): rather than picking one single "the" name color and comparing it, this now scans every
+	 *  styled run in the name for the LORE-confirmed color specifically — a real rarity item's name always has
+	 *  that color SOMEWHERE in it (whether or not something else entirely unrelated, like reverted master
+	 *  stars, also appears later), so this can't be thrown off by an unrelated trailing (or leading) run
+	 *  anymore, regardless of which end of the name it's on. */
 	private static Integer combinedRarityColorOf(ItemStack stack) {
-		Integer nameColor = nameColorOf(stack);
-		if (nameColor == null) return null;
 		Integer loreColor = loreRarityColorOf(stack);
-		return nameColor.equals(loreColor) ? nameColor : null;
+		if (loreColor == null) return null;
+		return nameContainsColor(stack, loreColor) ? loreColor : null;
+	}
+
+	/** True if any styled run in the item's display name is colored exactly {@code targetColor} — see
+	 *  {@link #combinedRarityColorOf}'s own doc comment for why this replaced comparing a single
+	 *  "the" name color. */
+	private static boolean nameContainsColor(ItemStack stack, int targetColor) {
+		java.util.concurrent.atomic.AtomicBoolean found = new java.util.concurrent.atomic.AtomicBoolean(false);
+		stack.getHoverName().visit((style, text) -> {
+			if (!text.isEmpty() && style.getColor() != null && style.getColor().getValue() == targetColor) {
+				found.set(true);
+			}
+			return java.util.Optional.<Void>empty();
+		}, Style.EMPTY);
+		return found.get();
 	}
 
 	/** Screen-aware entry point used by the container-screen render path. Per user request, the Pets menu is

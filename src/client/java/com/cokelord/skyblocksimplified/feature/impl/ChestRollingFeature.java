@@ -290,6 +290,19 @@ public class ChestRollingFeature extends Feature {
 		TrackedRun(long expiryMillis, boolean rolled) { this.expiryMillis = expiryMillis; this.rolled = rolled; }
 	}
 	private final java.util.List<TrackedRun> trackedRuns = new java.util.ArrayList<>();
+	// Real bug found (per user report — "tie the croesus list to current user in case people have multiple
+	// accounts"): trackedRuns used to live in the main skyblocksimplified.json config, which is ONE file
+	// shared by every real Hypixel account that ever uses this client install — so a second account logging
+	// in on the same computer saw the first account's real Croesus run history/rolled-state, and any run it
+	// tracked overwrote that shared file for both. Moved to its own per-account file, the exact same pattern
+	// StorageOverlayFeature's own storageFile() already established for this identical "real per-account
+	// Hypixel data, not a shared mod setting" problem.
+	private boolean trackedRunsDiskLoaded = false;
+	// One-shot migration source: loadPersistedData (called long before any player/account is known) stashes
+	// whatever the OLD shared-config location still has here; loadTrackedRunsFromDiskOnce consumes it only
+	// if the new per-account file doesn't exist yet, so an upgrading player's in-progress 3-day tracked runs
+	// aren't silently discarded by this move.
+	private java.util.List<TrackedRun> migratedTrackedRuns = null;
 	private static final long RUN_TRACK_EXPIRY_MILLIS = 3L * 24 * 60 * 60 * 1000L; // 3 real days, matches Hypixel's own confirmed Croesus retention.
 	// Real gap found (per user report — "The mod doesnt tie runs to stuff if theres only one page. If theres
 	// only one page of runs the gui name is Croesus only, no 1/2 or anything"): a single-page Croesus history
@@ -323,6 +336,7 @@ public class ChestRollingFeature extends Feature {
 	// which slot is clicked") — promoted to activeRunIndexForTierPicker once a real NEW tier-picker screen
 	// actually opens afterward (see onTick), so a click that doesn't lead anywhere never wrongly attaches.
 	private Integer pendingCroesusRunIndex = null;
+	private int lastTrackedRunId = Integer.MIN_VALUE;
 	// The run this SPECIFIC open tier-picker session is tied to, if it was reached via a Croesus click —
 	// per user spec ("if a rolling sequence happens without croesus opening again the user is rolling the
 	// clicked chest and not anything else"), this stays valid across multiple rolls within the same tier-
@@ -334,12 +348,76 @@ public class ChestRollingFeature extends Feature {
 	// one."
 	private int lastTierPickerContainerId = -1;
 
+	/** Real per-account file for {@link #trackedRuns} — see that field's own doc comment. Mirrors
+	 *  StorageOverlayFeature's storageFile() exactly: "unknown" only while no player is connected yet, which
+	 *  loadTrackedRunsFromDiskOnce() itself guards against ever actually reading/writing under. */
+	private static java.nio.file.Path trackedRunsFile() {
+		Minecraft mc = Minecraft.getInstance();
+		String uuid = mc.player != null ? mc.player.getUUID().toString() : "unknown";
+		return net.fabricmc.loader.api.FabricLoader.getInstance().getConfigDir()
+			.resolve("skyblocksimplified").resolve("croesus_runs").resolve(uuid + ".json");
+	}
+
+	/** Loads {@link #trackedRuns} from the current account's own file, exactly once — deliberately a no-op
+	 *  (never marks itself done) until a real player/account is actually known, since {@link #trackedRunsFile()}
+	 *  can't resolve the right file before then. Called from both onEnable() (covers enabling while already
+	 *  connected) and the JOIN listener (covers enabling before ever connecting this session) so either
+	 *  ordering ends up loaded correctly. */
+	private void loadTrackedRunsFromDiskOnce() {
+		if (trackedRunsDiskLoaded || Minecraft.getInstance().player == null) return;
+		trackedRunsDiskLoaded = true;
+		trackedRuns.clear();
+		java.nio.file.Path path = trackedRunsFile();
+		if (java.nio.file.Files.exists(path)) {
+			try (java.io.Reader reader = java.nio.file.Files.newBufferedReader(path, java.nio.charset.StandardCharsets.UTF_8)) {
+				JsonArray arr = com.google.gson.JsonParser.parseReader(reader).getAsJsonArray();
+				for (JsonElement el : arr) {
+					if (!el.isJsonObject()) continue;
+					JsonObject runObj = el.getAsJsonObject();
+					long expiry = runObj.has("expiry") ? runObj.get("expiry").getAsLong() : 0L;
+					boolean rolled = runObj.has("rolled") && runObj.get("rolled").getAsBoolean();
+					trackedRuns.add(new TrackedRun(expiry, rolled));
+				}
+			} catch (Exception e) {
+				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("Chest Rolling: failed to load this account's tracked runs, starting empty", e);
+			}
+		} else if (migratedTrackedRuns != null) {
+			// One-time migration from the old shared-config location — see trackedRuns'/migratedTrackedRuns'
+			// own doc comments.
+			trackedRuns.addAll(migratedTrackedRuns);
+			saveTrackedRunsToDisk();
+		}
+		migratedTrackedRuns = null;
+		pruneExpiredRuns();
+	}
+
+	private void saveTrackedRunsToDisk() {
+		if (Minecraft.getInstance().player == null) return;
+		java.nio.file.Path path = trackedRunsFile();
+		try {
+			java.nio.file.Files.createDirectories(path.getParent());
+			JsonArray arr = new JsonArray();
+			for (TrackedRun run : trackedRuns) {
+				JsonObject runObj = new JsonObject();
+				runObj.addProperty("expiry", run.expiryMillis);
+				runObj.addProperty("rolled", run.rolled);
+				arr.add(runObj);
+			}
+			try (java.io.Writer writer = java.nio.file.Files.newBufferedWriter(path, java.nio.charset.StandardCharsets.UTF_8)) {
+				new com.google.gson.Gson().toJson(arr, writer);
+			}
+		} catch (Exception e) {
+			com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("Chest Rolling: failed to save this account's tracked runs", e);
+		}
+	}
+
 	/** Removes every real-Croesus-expired entry — always safe to remove purely from the front (never the
 	 *  middle): every entry shares the exact same {@link #RUN_TRACK_EXPIRY_MILLIS} duration and is appended
 	 *  in strict chronological order (see {@link #trackedRuns}' own doc comment — oldest at the front, newest
 	 *  appended at the end), so the OLDEST entry (the front) always expires first — mirroring Hypixel's own
 	 *  real "oldest run ages off Croesus first" behavior exactly. */
 	private void pruneExpiredRuns() {
+		loadTrackedRunsFromDiskOnce();
 		long now = System.currentTimeMillis();
 		while (!trackedRuns.isEmpty() && trackedRuns.get(0).expiryMillis <= now) {
 			trackedRuns.remove(0);
@@ -354,6 +432,12 @@ public class ChestRollingFeature extends Feature {
 	 *  nav arrow) resolves which tracked run it corresponds to. Sets {@link #pendingCroesusRunIndex} rather
 	 *  than {@link #activeRunIndexForTierPicker} directly — a click that doesn't actually lead to a new
 	 *  tier-picker screen opening should never wrongly attach to whatever tier-picker screen opens next. */
+	/** True when the tier-picker currently open belongs to a tracked run already marked rolled. */
+	private boolean activeRunRolled() {
+		return activeRunIndexForTierPicker != null && activeRunIndexForTierPicker < trackedRuns.size()
+			&& trackedRuns.get(activeRunIndexForTierPicker).rolled;
+	}
+
 	private void onCroesusListClicked(int slotId) {
 		Minecraft mc = Minecraft.getInstance();
 		if (!(mc.gui.screen() instanceof AbstractContainerScreen<?> screen)) return;
@@ -375,15 +459,6 @@ public class ChestRollingFeature extends Feature {
 		pendingCroesusRunIndex = trackedIndex >= 0 && trackedIndex < trackedRuns.size() ? trackedIndex : null;
 	}
 
-	/** Per user request ("please add a 'clear cache' button inside croesus that fully clears the list so i
-	 *  can do testing"): wipes every tracked run outright — exposed for MainScreen's own new Croesus-panel
-	 *  button. */
-	public void clearTrackedRuns() {
-		trackedRuns.clear();
-		pendingCroesusRunIndex = null;
-		activeRunIndexForTierPicker = null;
-		com.cokelord.skyblocksimplified.config.ConfigManager.save();
-	}
 
 	private int lastProcessedContainerId = -1;
 	private Long rollStartMillis;
@@ -477,7 +552,8 @@ public class ChestRollingFeature extends Feature {
 			Slot hovered = ((com.cokelord.skyblocksimplified.mixin.AbstractContainerScreenAccessor) containerScreen).skyblocksimplified$getHoveredSlot();
 			if (hovered == null || hovered.getItem() != stack) return;
 			String tier = chestTierName(stack);
-			if (tier == null || isOpenedChestOption(stack) || recentlyRolledTiers.contains(tier)) return;
+			// A run already marked rolled shows its lore (per user spec).
+			if (tier == null || isOpenedChestOption(stack) || recentlyRolledTiers.contains(tier) || activeRunRolled()) return;
 			if (!hideLoreAllChests && !tier.equals(highestChestTierPresent(containerScreen))) return;
 			fabricateChestLore(lines);
 		});
@@ -503,6 +579,35 @@ public class ChestRollingFeature extends Feature {
 						.then(ClientCommands.argument("rare", StringArgumentType.word())
 							.suggests((ctx, builder) -> net.minecraft.commands.SharedSuggestionProvider.suggest(RARE_ARG_TO_NAME.keySet(), builder))
 							.executes(ctx -> { testRoll(ctx.getSource(), StringArgumentType.getString(ctx, "floor"), StringArgumentType.getString(ctx, "rare")); return 1; })))));
+			// Tracked-run list for checking the Croesus mapping: newest first, with the Croesus slot each maps to.
+			ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+				dispatcher.register(ClientCommands.literal("sbsruns")
+					.executes(ctx -> { if (instance != null) instance.printTrackedRuns(); return 1; })
+					.then(ClientCommands.literal("clear").executes(ctx -> {
+						if (instance == null) return 0;
+						instance.loadTrackedRunsFromDiskOnce();
+						instance.trackedRuns.clear();
+						instance.saveTrackedRunsToDisk();
+						com.cokelord.skyblocksimplified.util.ChatText.clientMessage("§b[SBS] §fTracked runs cleared.");
+						return 1;
+					}))));
+		}
+	}
+
+	private void printTrackedRuns() {
+		pruneExpiredRuns();
+		if (trackedRuns.isEmpty()) {
+			com.cokelord.skyblocksimplified.util.ChatText.clientMessage("§b[SBS] §fNo tracked runs.");
+			return;
+		}
+		com.cokelord.skyblocksimplified.util.ChatText.clientMessage("§b[SBS] §fTracked runs (newest = Croesus run 1):");
+		long now = System.currentTimeMillis();
+		for (int rank = 0; rank < trackedRuns.size(); rank++) {
+			TrackedRun run = trackedRuns.get(trackedRuns.size() - 1 - rank);
+			long agoMin = Math.max(0, (now - (run.expiryMillis - RUN_TRACK_EXPIRY_MILLIS)) / 60_000L);
+			String ago = agoMin >= 60 ? (agoMin / 60) + "h " + (agoMin % 60) + "m" : agoMin + "m";
+			com.cokelord.skyblocksimplified.util.ChatText.clientMessage("§7 #" + (rank + 1) + " §fended " + ago + " ago "
+				+ (run.rolled ? "§a(rolled)" : "§e(not rolled)"));
 		}
 	}
 
@@ -603,6 +708,10 @@ public class ChestRollingFeature extends Feature {
 
 	@Override
 	protected void onEnable() {
+		// See trackedRuns'/loadTrackedRunsFromDiskOnce's own doc comments — covers enabling while already
+		// connected to a real account; the JOIN listener registered below covers enabling before ever
+		// connecting this session (mc.player is still null right here in that case).
+		loadTrackedRunsFromDiskOnce();
 		// Real bug found (per user report — "cant move stuff from my storage to my inventory sometimes...
 		// its in all menus where my inventory is showing"): this used to block a click on ANY open container
 		// screen for the whole roll-animation window, with no check that the click was even happening on the
@@ -643,6 +752,12 @@ public class ChestRollingFeature extends Feature {
 
 		if (!runTrackingListenersRegistered) {
 			runTrackingListenersRegistered = true;
+			// Covers enabling this feature BEFORE ever connecting this session (onEnable's own
+			// loadTrackedRunsFromDiskOnce() call above no-ops with no player yet) — fires once a real account
+			// is actually known, same as StorageOverlayFeature's own account-scoped disk load.
+			net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+				if (instance != null && instance.isEnabled()) instance.loadTrackedRunsFromDiskOnce();
+			});
 			// See trackedRuns' own field doc comment. Real signal reused verbatim from Auto-
 			// Requeue per user request, gated on this feature's own enabled state the same way every other
 			// chat listener in this class already is.
@@ -659,12 +774,16 @@ public class ChestRollingFeature extends Feature {
 					// DungeonState.isInBoss() as the user's own requested proxy for "this run actually reached
 					// a real chest-rewarding state" — still reliably true at this exact instant, since
 					// DungeonState only resets later, on the separate "instance will close" chat line.
-					if (com.cokelord.skyblocksimplified.dungeon.DungeonState.isInBoss()) {
+					int runId = com.cokelord.skyblocksimplified.dungeon.DungeonState.getRunId();
+					if (com.cokelord.skyblocksimplified.dungeon.DungeonState.isInBoss() && runId != instance.lastTrackedRunId) {
+						// One entry per real run — a second "EXTRA STATS" line in the same run would shift every
+						// older entry one slot off.
+						instance.lastTrackedRunId = runId;
 						instance.pruneExpiredRuns();
 						// Appended at the END — see trackedRuns' own doc comment: index 0 is the OLDEST tracked
 						// run, newest goes at the bottom.
 						instance.trackedRuns.add(new TrackedRun(System.currentTimeMillis() + RUN_TRACK_EXPIRY_MILLIS, false));
-						com.cokelord.skyblocksimplified.config.ConfigManager.save();
+						instance.saveTrackedRunsToDisk();
 					}
 				}
 				return true;
@@ -743,6 +862,10 @@ public class ChestRollingFeature extends Feature {
 			// even if the page number itself happens to be unchanged from before (e.g. backing out of a
 			// tier-picker straight back to the same page). The very next click always starts fresh.
 			activeRunIndexForTierPicker = null;
+			// Per user report ("Highest chest should hide" — Bedrock's lore showed): the "just rolled" memory
+			// that re-shows a rolled chest's lore belongs to ONE run. Back on the Croesus list, the next run
+			// opened is a different run, so it must start hidden again.
+			recentlyRolledTiers.clear();
 		} else if (TIER_PICKER_SCREEN.matcher(screenTitle).matches()) {
 			int tierPickerContainerId = screen.getMenu().containerId;
 			if (tierPickerContainerId != lastTierPickerContainerId) {
@@ -859,27 +982,15 @@ public class ChestRollingFeature extends Feature {
 		// Chests hide/click-block) even though it never plays the CS-case animation.
 		String normalizedTier = "wooden".equalsIgnoreCase(chestTypeName) ? "Wood"
 			: Character.toUpperCase(chestTypeName.charAt(0)) + chestTypeName.substring(1).toLowerCase(Locale.ROOT);
-		recentlyRolledTiers.add(normalizedTier);
-		// Per user redesign — see trackedRuns'/TrackedRun's own doc comment: this is the one place a genuine
-		// chest-open is already confirmed (sawMarker, above every animation gate), so it's also the right
-		// place to permanently mark the SPECIFIC tracked run this tier-picker session was opened from (set
-		// only when reached via a real Croesus list click — see activeRunIndexForTierPicker's own doc
-		// comment) as rolled, rather than relying on recentlyRolledTiers' session-only memory that forgets
-		// the moment the player leaves the tier-picker screen.
-		boolean wasAlreadyRolled = false;
+		// Per user spec: runs are tracked in completion order and matched to Croesus by position (oldest
+		// entry = last Croesus slot, newest = first). Rolling a run's chest marks THAT run rolled — it never
+		// rolls again and its lore shows. Same-visit memory (back button) also prevents a second roll.
+		boolean wasAlreadyRolled = !recentlyRolledTiers.add(normalizedTier);
 		if (activeRunIndexForTierPicker != null && activeRunIndexForTierPicker < trackedRuns.size()) {
 			TrackedRun run = trackedRuns.get(activeRunIndexForTierPicker);
-			wasAlreadyRolled = run.rolled;
-			run.rolled = true;
-			com.cokelord.skyblocksimplified.config.ConfigManager.save();
+			wasAlreadyRolled |= run.rolled;
+			if (!run.rolled) { run.rolled = true; saveTrackedRunsToDisk(); }
 		}
-		// Per user report ("The tracking now works perfectly... but now doesnt actually stop the rolling from
-		// happening if the chest has been rolled"): the whole point of the `rolled` flag is to know when a
-		// specific tracked run's chest has already been claimed once — reaching this exact point again for
-		// the SAME run (`rolled` was already true before the line above) means this is a re-open of an
-		// already-rolled chest, so the CS-case animation shouldn't play a second time. Same early-return shape
-		// as the onlyBedrock/onlyCroesus gates right below (the real screen still renders normally underneath,
-		// nothing here ever hides/blocks the vanilla GUI itself — only OUR animation is skipped).
 		if (wasAlreadyRolled) return;
 
 		boolean bedrock = "bedrock".equalsIgnoreCase(chestTypeName);
@@ -1262,7 +1373,14 @@ public class ChestRollingFeature extends Feature {
 		// startRoll() actually fired at the END of that wait. Blanking the exact same screen reference the
 		// poll is already tracking closes that gap — the real contents are never drawn on screen at all, from
 		// the very first frame the chest GUI opens.
-		return instance.pendingChestScreen == screen;
+		if (instance.pendingChestScreen == screen) return true;
+		// Per user report ("I can also see the drops in the chest before it rolls for a split second"):
+		// pendingChestScreen is only set on the next CLIENT TICK after the GUI opens, so the frames rendered
+		// before that tick still drew the real contents. A reward-chest screen this feature hasn't processed
+		// yet is blanked from its very first frame; onTick then either starts the roll or (a chest this
+		// feature won't roll) marks it processed, which shows it normally within one tick.
+		return instance.isEnabled() && screen.getMenu().containerId != instance.lastProcessedContainerId
+			&& CHEST_TITLE_PATTERN.matcher(screen.getTitle().getString().trim()).matches();
 	}
 
 	public static void renderReplacement(GuiGraphicsExtractor graphics, AbstractContainerScreen<?> screen) {
@@ -1495,17 +1613,8 @@ public class ChestRollingFeature extends Feature {
 		obj.addProperty("hideLoreAllChests", hideLoreAllChests);
 		obj.addProperty("landSoundEnabled", landSoundEnabled);
 		obj.add("landSound", landSound.toJson());
-		// See trackedRuns'/TrackedRun's own doc comment — persisted so the tracker (including which runs
-		// have already been rolled) survives a relaunch instead of forgetting everything the moment the game
-		// closes.
-		JsonArray runsArray = new JsonArray();
-		for (TrackedRun run : trackedRuns) {
-			JsonObject runObj = new JsonObject();
-			runObj.addProperty("expiry", run.expiryMillis);
-			runObj.addProperty("rolled", run.rolled);
-			runsArray.add(runObj);
-		}
-		obj.add("trackedRuns", runsArray);
+		// trackedRuns is NO LONGER written here — see its own doc comment: it now lives in its own
+		// per-account file via saveTrackedRunsToDisk(), not this shared, all-accounts config.
 		return obj;
 	}
 
@@ -1522,25 +1631,29 @@ public class ChestRollingFeature extends Feature {
 		if (obj.has("hideLoreAllChests")) hideLoreAllChests = obj.get("hideLoreAllChests").getAsBoolean();
 		if (obj.has("landSoundEnabled")) landSoundEnabled = obj.get("landSoundEnabled").getAsBoolean();
 		if (obj.has("landSound")) landSound.fromJson(obj.get("landSound"));
+		// Real bug found (per user report — "tie the croesus list to current user in case people have
+		// multiple accounts"): trackedRuns moved to its own per-account file (see that field's own doc
+		// comment) — this only ever STASHES whatever the OLD shared-config shape still has here (this method
+		// runs long before any player/account is known, so there's no real UUID to write a per-account file
+		// under yet), for loadTrackedRunsFromDiskOnce() to migrate in later, once an account is actually
+		// known, but only if that account has no per-account file of its own yet.
 		if (obj.has("trackedRuns") && obj.get("trackedRuns").isJsonArray()) {
-			trackedRuns.clear();
+			migratedTrackedRuns = new java.util.ArrayList<>();
 			for (JsonElement el : obj.getAsJsonArray("trackedRuns")) {
 				if (el.isJsonObject()) {
 					JsonObject runObj = el.getAsJsonObject();
 					long expiry = runObj.has("expiry") ? runObj.get("expiry").getAsLong() : 0L;
 					boolean rolled = runObj.has("rolled") && runObj.get("rolled").getAsBoolean();
-					trackedRuns.add(new TrackedRun(expiry, rolled));
+					migratedTrackedRuns.add(new TrackedRun(expiry, rolled));
 				} else if (el.isJsonPrimitive()) {
-					trackedRuns.add(new TrackedRun(el.getAsLong(), false));
+					migratedTrackedRuns.add(new TrackedRun(el.getAsLong(), false));
 				}
 			}
-			pruneExpiredRuns();
 		} else if (obj.has("trackedRunExpiryMillis") && obj.get("trackedRunExpiryMillis").isJsonArray()) {
 			// Backward compat with the pre-run-list-rewrite key/shape — a plain expiry-millis list with no
-			// rolled state, from before this round.
-			trackedRuns.clear();
-			for (JsonElement el : obj.getAsJsonArray("trackedRunExpiryMillis")) trackedRuns.add(new TrackedRun(el.getAsLong(), false));
-			pruneExpiredRuns();
+			// rolled state, from before that round.
+			migratedTrackedRuns = new java.util.ArrayList<>();
+			for (JsonElement el : obj.getAsJsonArray("trackedRunExpiryMillis")) migratedTrackedRuns.add(new TrackedRun(el.getAsLong(), false));
 		}
 	}
 

@@ -185,10 +185,30 @@ public class LeapMenuFeature extends Feature {
 		if (instance == null) return;
 		try {
 			instance.renderFullScreenBackground(graphics);
+			// Per user request ("make sure its below z level of the leap menu and the black background, but
+			// above all else"): drawn explicitly here, sandwiched between this screen's own background and its
+			// quadrant boxes, instead of trusting the general HUD-hook's own draw order relative to this
+			// replaced screen — see EarlyEnterDetectionFeature's own HUD registration doc comment.
+			EarlyEnterDetectionFeature.renderScreenColorOverlayIfActive(graphics);
 			instance.renderQuadrants(graphics);
 		} catch (Exception e) {
 			com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("Leap Menu render failed, skipping this frame", e);
 		}
+	}
+
+	/** Per user request ("Add a new option in the early enter detection module that coordinates the leap menu
+	 *  and the early enter detection... going into the leap menu hides the ones that are not leaping and shows
+	 *  only the early enter person in the center"): resolves {@link EarlyEnterDetectionFeature}'s currently
+	 *  active early-enter username (if any, and only while its own 5-second window hasn't elapsed) against a
+	 *  real live teammate, so this can be null even when a username is technically still "active" (e.g. they
+	 *  already left the party). */
+	private static DungeonPlayer activeHighlightedTeammate() {
+		String username = EarlyEnterDetectionFeature.getActiveLeapMenuHighlightUsername();
+		if (username == null) return null;
+		for (DungeonPlayer teammate : DungeonState.getTeammatesNoSelf()) {
+			if (teammate.name.equalsIgnoreCase(username)) return teammate;
+		}
+		return null;
 	}
 
 	private void renderFullScreenBackground(GuiGraphicsExtractor graphics) {
@@ -255,9 +275,21 @@ public class LeapMenuFeature extends Feature {
 	}
 
 	private void renderQuadrants(GuiGraphicsExtractor graphics) {
+		Minecraft mc = Minecraft.getInstance();
+		DungeonPlayer highlighted = activeHighlightedTeammate();
+		if (highlighted != null) {
+			// Per user request ("shows only the early enter person in the center"): a single, larger box
+			// centered on screen instead of the normal quadrant grid — see activeHighlightedTeammate's own
+			// doc comment for the 5-second self-expiry that reverts this back to normal with no extra code.
+			int w = Math.round(BOX_WIDTH * renderScale);
+			int h = Math.round(BOX_HEIGHT * renderScale);
+			int halfW = mc.getWindow().getGuiScaledWidth() / 2;
+			int halfH = mc.getWindow().getGuiScaledHeight() / 2;
+			drawPlayerBox(graphics, highlighted, halfW - w / 2, halfH - h / 2, w, h);
+			return;
+		}
 		List<DungeonPlayer> teammates = sortedTeammates();
 		if (teammates.isEmpty()) return;
-		Minecraft mc = Minecraft.getInstance();
 		// The real vanilla background/slots are now cancelled outright by LeapMenuCustomGuiBackgroundMixin/
 		// LeapMenuCustomGuiRenderMixin before this ever runs (see shouldReplaceRender's doc comment for why
 		// painting an opaque rect over them here — the old approach — wasn't good enough), so this only
@@ -274,69 +306,76 @@ public class LeapMenuFeature extends Feature {
 			int h = Math.round(BOX_HEIGHT * renderScale);
 			int x = col == 0 ? nearX - w : nearX;
 			int y = row == 0 ? nearY - h : nearY;
+			drawPlayerBox(graphics, player, x, y, w, h);
+		}
+	}
 
-			// Per user request ("make all buttons darker gray and make the outline the class color instead"):
-			// the old class-color/backgroundColor FILL choice is gone — every quadrant box now fills with the
-			// same fixed dark gray and gets a real class-colored outline around it instead, so the per-class
-			// color is still immediately visible without making white/class-colored text hard to read against
-			// a bright class-color fill. colorStyle now only ever affects the TEXT color below (white vs
-			// class-colored) — the one part of its old meaning that's still independently useful.
-			RenderUtil.fillRounded(graphics, x, y, x + w, y + h, 9, 0xF0303030);
-			RenderUtil.fillRoundedRing(graphics, x, y, x + w, y + h, 9, 2, player.clazz.color);
+	/** One quadrant box's worth of drawing (fill, outline, face icon, name/class text) — extracted so the
+	 *  single-centered "early enter" highlight box (see {@link #renderQuadrants}) can draw exactly the same
+	 *  box, just at different coordinates, instead of duplicating this whole block. */
+	private void drawPlayerBox(GuiGraphicsExtractor graphics, DungeonPlayer player, int x, int y, int w, int h) {
+		Minecraft mc = Minecraft.getInstance();
+		// Per user request ("make all buttons darker gray and make the outline the class color instead"):
+		// the old class-color/backgroundColor FILL choice is gone — every quadrant box now fills with the
+		// same fixed dark gray and gets a real class-colored outline around it instead, so the per-class
+		// color is still immediately visible without making white/class-colored text hard to read against
+		// a bright class-color fill. colorStyle now only ever affects the TEXT color below (white vs
+		// class-colored) — the one part of its old meaning that's still independently useful.
+		RenderUtil.fillRounded(graphics, x, y, x + w, y + h, 9, 0xF0303030);
+		RenderUtil.fillRoundedRing(graphics, x, y, x + w, y + h, 9, 2, player.clazz.color);
 
-			int iconSize = Math.round(28 * renderScale);
-			int iconX = x + 8;
-			int iconY = y + (h - iconSize) / 2;
-			// Real bug found (per user report — "Leap menu does not show heads mostly. Sometimes it shows 1 or
-			// 2, it should always show the heads of the players when opened"): this only ever drew a head when
-			// player.entity was a currently-live AbstractClientPlayer — but the leap menu is opened by holding
-			// Spirit Leap mid-fight, exactly when most teammates are commonly out of render distance or in a
-			// different room and have no live tracked entity at all, so most/all heads silently skipped. Same
-			// root cause and fix already found for the Dungeon Map's own head rendering (see that feature's
-			// drawTeammateMarker call site): Minecraft's own tab list (PlayerInfo, from
-			// ClientboundPlayerInfoUpdatePacket) tracks every real player on the server by name regardless of
-			// entity-render distance, and carries the same real PlayerSkin a live entity's own getSkin() would
-			// return — resolved by name here instead of requiring a live entity.
-			net.minecraft.world.entity.player.PlayerSkin skin = player.entity instanceof AbstractClientPlayer acp
-				? acp.getSkin() : null;
-			if (skin == null) {
-				var conn = mc.getConnection();
-				var info = conn != null ? conn.getPlayerInfo(player.name) : null;
-				if (info != null) skin = info.getSkin();
+		int iconSize = Math.round(28 * renderScale);
+		int iconX = x + 8;
+		int iconY = y + (h - iconSize) / 2;
+		// Real bug found (per user report — "Leap menu does not show heads mostly. Sometimes it shows 1 or
+		// 2, it should always show the heads of the players when opened"): this only ever drew a head when
+		// player.entity was a currently-live AbstractClientPlayer — but the leap menu is opened by holding
+		// Spirit Leap mid-fight, exactly when most teammates are commonly out of render distance or in a
+		// different room and have no live tracked entity at all, so most/all heads silently skipped. Same
+		// root cause and fix already found for the Dungeon Map's own head rendering (see that feature's
+		// drawTeammateMarker call site): Minecraft's own tab list (PlayerInfo, from
+		// ClientboundPlayerInfoUpdatePacket) tracks every real player on the server by name regardless of
+		// entity-render distance, and carries the same real PlayerSkin a live entity's own getSkin() would
+		// return — resolved by name here instead of requiring a live entity.
+		net.minecraft.world.entity.player.PlayerSkin skin = player.entity instanceof AbstractClientPlayer acp
+			? acp.getSkin() : null;
+		if (skin == null) {
+			var conn = mc.getConnection();
+			var info = conn != null ? conn.getPlayerInfo(player.name) : null;
+			if (info != null) skin = info.getSkin();
+		}
+		if (skin != null) {
+			try {
+				PlayerFaceExtractor.extractRenderState(graphics, skin, iconX, iconY, iconSize);
+			} catch (Exception ignored) {
+				// Skin texture not downloaded/ready yet — just skip the icon this frame.
 			}
-			if (skin != null) {
-				try {
-					PlayerFaceExtractor.extractRenderState(graphics, skin, iconX, iconY, iconSize);
-				} catch (Exception ignored) {
-					// Skin texture not downloaded/ready yet — just skip the icon this frame.
+		}
+		int textX = iconX + iconSize + 8;
+
+		// Per user request ("make the text bold"): both lines rendered as real bold Components instead
+		// of plain strings.
+		int textColor = colorStyle ? 0xFFFFFFFF : player.clazz.color;
+		String primary = onlyShowClass ? player.clazz.name() : player.name;
+		graphics.text(mc.font, Component.literal(primary).withStyle(Style.EMPTY.withBold(true)), textX, y + Math.round(h / 2.5f), textColor);
+
+		if (!onlyShowClass || player.isDead) {
+			String secondary = player.isDead ? "DEAD" : player.clazz.name();
+			int secondaryColor = player.isDead ? 0xFFFF5555 : 0xFFFFFFFF;
+			int secondaryY = y + Math.round(h / 1.7f);
+			int secondaryTextX = textX;
+			// Per user request ("the classes have different items next to the class name, like bow for
+			// archer, lingering regen potion for healer, a gray leather chestplate for tank, blaze rod
+			// for mage and an iron sword for berserk") — skipped for the DEAD label itself, only shown
+			// alongside the real class name line.
+			if (!player.isDead) {
+				ItemStack icon = classIcon(player.clazz);
+				if (!icon.isEmpty()) {
+					graphics.item(icon, secondaryTextX, secondaryY - 5);
+					secondaryTextX += 18;
 				}
 			}
-			int textX = iconX + iconSize + 8;
-
-			// Per user request ("make the text bold"): both lines rendered as real bold Components instead
-			// of plain strings.
-			int textColor = colorStyle ? 0xFFFFFFFF : player.clazz.color;
-			String primary = onlyShowClass ? player.clazz.name() : player.name;
-			graphics.text(mc.font, Component.literal(primary).withStyle(Style.EMPTY.withBold(true)), textX, y + Math.round(h / 2.5f), textColor);
-
-			if (!onlyShowClass || player.isDead) {
-				String secondary = player.isDead ? "DEAD" : player.clazz.name();
-				int secondaryColor = player.isDead ? 0xFFFF5555 : 0xFFFFFFFF;
-				int secondaryY = y + Math.round(h / 1.7f);
-				int secondaryTextX = textX;
-				// Per user request ("the classes have different items next to the class name, like bow for
-				// archer, lingering regen potion for healer, a gray leather chestplate for tank, blaze rod
-				// for mage and an iron sword for berserk") — skipped for the DEAD label itself, only shown
-				// alongside the real class name line.
-				if (!player.isDead) {
-					ItemStack icon = classIcon(player.clazz);
-					if (!icon.isEmpty()) {
-						graphics.item(icon, secondaryTextX, secondaryY - 5);
-						secondaryTextX += 18;
-					}
-				}
-				graphics.text(mc.font, Component.literal(secondary).withStyle(Style.EMPTY.withBold(true)), secondaryTextX, secondaryY, secondaryColor);
-			}
+			graphics.text(mc.font, Component.literal(secondary).withStyle(Style.EMPTY.withBold(true)), secondaryTextX, secondaryY, secondaryColor);
 		}
 	}
 
@@ -357,6 +396,14 @@ public class LeapMenuFeature extends Feature {
 	}
 
 	private void onQuadrantClick(AbstractContainerScreen<?> screen, double mouseX, double mouseY) {
+		// Per user request — see renderQuadrants' own doc comment: while the single centered "early enter"
+		// highlight box is showing, there is only one thing to leap to, so any click leaps to them instead of
+		// running the normal quadrant/map-marker hit-testing below.
+		DungeonPlayer highlighted = activeHighlightedTeammate();
+		if (highlighted != null) {
+			leapTo(highlighted, screen);
+			return;
+		}
 		// Real bug found (per user request — "sync with map should not disallow me from leaping regularly,
 		// it should only add the option that allows me to click heads on the map"): this used to fully
 		// REPLACE the normal quadrant-click behavior whenever Sync with Map was on — any click that didn't
@@ -384,12 +431,21 @@ public class LeapMenuFeature extends Feature {
 	}
 
 	private void onKeyPress(AbstractContainerScreen<?> screen, net.minecraft.client.input.KeyEvent event) {
+		KeyMapping[] keys = {topLeft, topRight, bottomLeft, bottomRight};
+		// Per user request — see renderQuadrants' own doc comment: while the single highlight box is up,
+		// there's only one real target, so any of the four keybinds leaps to them.
+		DungeonPlayer highlighted = activeHighlightedTeammate();
+		if (highlighted != null) {
+			for (KeyMapping key : keys) {
+				if (!key.isUnbound() && key.matches(event)) { leapTo(highlighted, screen); return; }
+			}
+			return;
+		}
 		// Real bug found (see onQuadrantClick's own doc comment — same "Sync with Map should be additive,
 		// not a replacement" fix): the four corner keybinds used to be disabled entirely whenever Sync with
 		// Map was on, even though they still map onto the same quadrant-sorted teammate list either way —
 		// nothing about map-marker clicking actually requires giving these up.
 		List<DungeonPlayer> teammates = sortedTeammates();
-		KeyMapping[] keys = {topLeft, topRight, bottomLeft, bottomRight};
 		for (int i = 0; i < keys.length; i++) {
 			if (keys[i].isUnbound() || !keys[i].matches(event)) continue;
 			if (i < teammates.size()) leapTo(teammates.get(i), screen);

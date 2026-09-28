@@ -169,41 +169,26 @@ public class DungeonScoreCalculatorFeature extends Feature implements MoveableWi
 	public record ScoreBreakdown(int explore, int skill, int speed, int bonus, int total, String tier, boolean paulActive) {}
 
 	public ScoreBreakdown computeScore() {
+		// Per user report ("The score approx is also off by 2-3 at times. Compare with odins"): matched to Odin's
+		// DungeonUtils.updateScore(). Differences fixed: (1) Blood counts as a room until the Watcher is done
+		// and so does the room you're standing in before boss (the tab list's "Completed Rooms" excludes both);
+		// (2) Skill includes the room-clear share: 20 + floor(clear * 80) - 10 per unfinished puzzle - deaths,
+		// clamped 20..100 (it used to be a flat 100 minus penalties, 14 per puzzle); (3) the secret share
+		// isn't rounded up to a whole required-secret count first.
 		int secretsFound = DungeonState.getSecretsFound();
 		float secretsPercent = DungeonState.getSecretsPercent();
-		int totalSecrets = (secretsFound == 0 || secretsPercent == 0f) ? 0 : Math.round(100f / secretsPercent * secretsFound);
-		int totalSecretsRequired = (int) Math.ceil(requiredSecretPercent() * totalSecrets);
-		float actualSecretPercent = totalSecretsRequired <= 0 ? 0f : Math.min(secretsFound / (float) totalSecretsRequired, 1f);
-		double secretScore = actualSecretPercent * 40.0;
+		int totalSecrets = (secretsFound == 0 || secretsPercent == 0f) ? 0 : (int) Math.floor(100f / secretsPercent * secretsFound + 0.5f);
+		double secretScore = totalSecrets <= 0 ? 0
+			: Math.max(0, Math.min(40, Math.floor(secretsFound / (totalSecrets * requiredSecretPercent()) * 40.0)));
 
-		int totalRooms = computeTotalRooms();
-		// Eleventh bug found (per user report — "The score approx is still bugged... off by about 6"): this
-		// used to feed DungeonState.getCompletedRooms() straight in, but the real formula (confirmed
-		// against NoammAddons' ScoreCalculation.kt — its "effectiveCompletedRooms") also credits the room
-		// you're CURRENTLY standing in and actively clearing, not only rooms already fully closed out — a
-		// flat +1 for as long as you haven't reached the boss door yet. Simplified from the real two-term
-		// version (a second, separate "+1 until the Blood door has actually been opened" on top of the
-		// general "+1 until boss") down to this single !isInBoss() term: that extra Blood-specific term
-		// only ever differs from plain !isInBoss() for the few seconds right as Blood opens, and — the part
-		// that actually matters here — it's back to matching completedRooms exactly by the time a run is
-		// FINISHED either way, so it was never the source of a wrong final score; not worth a dedicated
-		// real-time Blood-door detector just to shave a few seconds of mid-run display accuracy.
-		int completedRooms = DungeonState.getCompletedRooms() + (DungeonState.isInBoss() ? 0 : 1);
-		float actualClearPercent = totalRooms <= 0 ? 0f : Math.min(completedRooms / (float) totalRooms, 1f);
-		double roomClearScore = actualClearPercent * 60.0;
+		int computedTotal = computeTotalRooms();
+		int totalRooms = computedTotal != 0 ? computedTotal : 36;
+		int completedRooms = DungeonState.getCompletedRooms() + (DungeonState.isBloodDone() ? 0 : 1) + (DungeonState.isInBoss() ? 0 : 1);
+		double clearFraction = Math.min(1.0, completedRooms / (double) totalRooms);
+		double roomClearScore = Math.floor(clearFraction * 60.0);
 		int explore = entranceMultiplied(secretScore) + entranceMultiplied(roomClearScore);
 
 		int deaths = DungeonState.getDeaths();
-		// Real formula, per the current Hypixel wiki's own Dungeon Score page: every death costs 2 points,
-		// EXCEPT the first death of the run, which only costs 1 IF that specific player owns a Legendary
-		// Spirit Pet (checked in their pets menu, not whether it's actively equipped) — not an unconditional
-		// forgiveness for everyone regardless of loadout, per user request ("On the first death, it should
-		// pull api data about the player that died and if they have a legendary spirit pet in their pets
-		// menu the death should only be a -1"). DungeonState kicks off the real name->UUID->profile lookup
-		// the moment the first death happens (see its own doc comment), so by the time a score is actually
-		// checked the data has usually already arrived; falls back to the unforgiven -2 if it hasn't (or the
-		// player has no Legendary Spirit Pet), same "no enrichment yet" degrade every other API-backed
-		// feature in this codebase already uses.
 		int deathPenalty = deaths == 0 ? 0 : Math.max(0, 2 * deaths - (firstDeathSpiritForgiveness() ? 1 : 0));
 		int completedPuzzles = 0;
 		int seenPuzzles = 0;
@@ -213,20 +198,8 @@ public class DungeonScoreCalculatorFeature extends Feature implements MoveableWi
 			if (puzzle.status == PuzzleStatus.COMPLETED) completedPuzzles++;
 		}
 		int totalPuzzles = Math.max(DungeonState.getPuzzleCount(), seenPuzzles);
-		// Real bug found (per user report — "the score calc is still off by like 7... it only seems to be
-		// off on lower floors, on M6 it works fine"): Skill Score has NO relationship to room-clear
-		// percentage at all — confirmed against Skytils' own real ScoreCalculation.java, whose skill score is
-		// a flat `100 - 2*deaths - 14*(missing+failed puzzles)`, and independently corroborated by the
-		// current Hypixel wiki's own "Skill = floor(100 - Deaths x 2 - Failed Puzzles x 14)". The previous
-		// `20 + clearPercent*80` term was wrong: since a run's clear percentage is naturally well under 100%
-		// for most of a floor and only reaches ~100% right before the boss door, that formula understated the
-		// true (clear%-independent) skill score by roughly the gap between current clear% and 100% — which
-		// is exactly why M6 "worked fine" (parties routinely full-clear master floors before the boss, so
-		// clearPercent was already ~100% and the wrong formula happened to converge on the same number) while
-		// every earlier floor, still mid-clear when checked, read low by whatever percentage remained. Also
-		// corrects the puzzle penalty weight from 10 to the real 14 per incomplete puzzle (same two sources).
-		int puzzlePenalty = 14 * Math.max(0, totalPuzzles - completedPuzzles);
-		double skillScoreRaw = Math.max(100.0 - (deathPenalty + puzzlePenalty), 0.0);
+		int puzzlePenalty = 10 * Math.max(0, totalPuzzles - completedPuzzles);
+		double skillScoreRaw = Math.max(20.0, Math.min(100.0, 20.0 + Math.floor(clearFraction * 80.0) - puzzlePenalty - deathPenalty));
 		int skill = entranceMultiplied(skillScoreRaw);
 
 		int elapsedSeconds = parseElapsedSeconds(DungeonState.getElapsedTime());
@@ -282,12 +255,14 @@ public class DungeonScoreCalculatorFeature extends Feature implements MoveableWi
 	 *  DungeonState.firstDeathPlayerName's own doc comment for the real Hypixel rule this implements. Reads
 	 *  through the same real MojangApi/SkyblockStatsApi cache Party Finder already populates the same way. */
 	private static boolean firstDeathSpiritForgiveness() {
+		// Odin always assumes the first death is forgiven; we check the real pet when the stats are loaded and
+		// fall back to Odin's assumption while they aren't.
 		String name = DungeonState.getFirstDeathPlayerName();
-		if (name == null) return false;
+		if (name == null) return true;
 		String uuid = com.cokelord.skyblocksimplified.api.MojangApi.get(name);
-		if (uuid == null) return false;
+		if (uuid == null) return true;
 		com.cokelord.skyblocksimplified.api.SkyblockStatsApi.PlayerStats stats = com.cokelord.skyblocksimplified.api.SkyblockStatsApi.get(uuid);
-		return stats != null && stats.hasLegendarySpiritPet();
+		return stats == null || stats.hasLegendarySpiritPet();
 	}
 
 	/** Real confirmed Hypixel mayor perk name ("EzPz") that adds +10 dungeon bonus score — cross-checked

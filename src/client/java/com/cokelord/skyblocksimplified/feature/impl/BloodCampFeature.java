@@ -97,6 +97,15 @@ public class BloodCampFeature extends Feature {
 	// ---- Move Prediction settings ----
 	private boolean movePrediction = true;
 	private boolean partyMoveTime = false;
+	// ---- Watcher speed (per user request: "Slow/Fast/Normal Watcher!" title + party message + sound) ----
+	// Odin (BloodCamp.kt) has no named watcher types; its only speed signal is how many seconds pass between
+	// the Watcher's greeting and "Let's see how you can handle this.", bucketed into a 1.2-1.8s move time
+	// (predTicks 24/27/30/33/36 above). Our naming of those buckets: 24-27 ticks Fast, 30 Normal, 33+ Slow.
+	private boolean watcherSpeedTitle = true;
+	private boolean watcherSpeedParty = false;
+	private boolean watcherSpeedSoundEnabled = true;
+	private final com.cokelord.skyblocksimplified.sound.CustomSoundOption watcherSpeedSound =
+		new com.cokelord.skyblocksimplified.sound.CustomSoundOption(TerminalSoundsFeature.SOUND_IDS, TerminalSoundsFeature.SOUND_LABELS);
 	private boolean killTitle = true;
 
 	// ---- Blood Assist settings ----
@@ -153,6 +162,8 @@ public class BloodCampFeature extends Feature {
 	// consecutive ticks before actually latching data.started rejects a one-tick spike without meaningfully
 	// delaying detection of genuine movement (delayed by at most (this - 1) real ticks either way).
 	private static final int REQUIRED_CONSECUTIVE_MOVEMENT_TICKS = 3;
+	// Server-position tracking (see updateTracking): consecutive move PACKETS needed to confirm a drift.
+	private static final int REQUIRED_CONSECUTIVE_MOVEMENT_PACKETS = 2;
 	// History on speedVectors' averaging method, for whoever reads this next: a permanent early-window
 	// freeze (locks in whatever the first ~500ms measured) was tried and reverted — a lag spike landing in
 	// that window corrupted the rest of the drop with no way to recover. A plain cumulative-since-start
@@ -262,12 +273,22 @@ public class BloodCampFeature extends Feature {
 		// exactly "the timer wrong completely... enters the box making it blue... then keeps going for a while
 		// more" once the real drift finally does start afterward. See updateTracking's own use of this counter.
 		int consecutiveMovementTicks = 0;
+		// Per user report ("really early... when i havent been in blood room the entire time and leap to
+		// mage"): ticks this marker was seen standing still before its drift began (the creation tick excluded,
+		// its delta is always zero). A marker first seen already mid-drift (you arrived late / leapt in) has 0,
+		// so its started time is late and it must not feed the kill-skip skew correction.
+		int ticksObserved = 0;
+		int stationaryTicks = 0;
+		long lastChangeTime;
+		long firstMoveTime;
 
 		EntityData(Vec3 startVector, long started, boolean firstSpawns) {
 			this.startVector = startVector;
 			this.started = started;
 			this.firstSpawns = firstSpawns;
 			this.lastPosition = startVector;
+			this.lastChangeTime = started;
+			this.firstMoveTime = started;
 		}
 	}
 
@@ -407,6 +428,7 @@ public class BloodCampFeature extends Feature {
 
 			moveTimeSeconds = predTicks / 20f;
 			Minecraft mc = Minecraft.getInstance();
+			announceWatcherSpeed(mc, predTicks);
 			if (partyMoveTime && mc.player != null && mc.player.connection != null) {
 				mc.player.connection.sendCommand("pc Watcher will move in " + fmt(moveTimeSeconds) + "s.");
 			}
@@ -535,115 +557,48 @@ public class BloodCampFeature extends Feature {
 	}
 
 	private void updateTracking(ArmorStand entity) {
-		Vec3 currentPos = entity.position();
+		// Per user request (compare with Odin's BloodCamp.kt): Odin tracks the EXACT positions from the
+		// server's move packets; this used to read entity.position(), the client's smoothed interpolation,
+		// which trails the real marker by a few ticks and eases in/out — delaying the start time and biasing
+		// the speed estimate. getPositionCodec().getBase() is the last server-sent position (vanilla sets it
+		// on every move/teleport packet), i.e. the same value Odin's packet event hands it.
+		Vec3 serverPos = entity.getPositionCodec().getBase();
+		Vec3 currentPos = serverPos == null || serverPos.equals(Vec3.ZERO) ? entity.position() : serverPos;
 		EntityData data = entityDataMap.computeIfAbsent(entity, e -> new EntityData(currentPos, currentTickTime, firstSpawns));
-
-		Vec3 delta = currentPos.subtract(data.lastPosition);
-		data.lastPosition = currentPos;
 		boolean wasStationary = data.deltaHistory.isEmpty();
-		// Real bug found (per user report — "the timer was going off too early, expiring like 2 seconds
-		// before the mob actually came out... the timer detection system is wrong sometimes"): this used to
-		// treat ANY nonzero delta.lengthSqr() as "real movement has begun" — but entity.position() is the
-		// client's own INTERPOLATED render position, which can drift by tiny sub-pixel amounts tick to tick
-		// purely from interpolation/position-resync smoothing even before the real Hypixel drift animation
-		// has genuinely started. Since data.started (the countdown's own zero point) latches on the very
-		// first tick "movement" is seen, a stray jitter tick a few ticks early starts the whole budget
-		// counting down before the mob has actually begun moving for real — exactly an intermittent ("wrong
-		// sometimes") early expiry, not a constant bias, since interpolation jitter isn't guaranteed to occur
-		// every single spawn. MIN_REAL_MOVEMENT_SQR is comfortably above any interpolation noise (well under
-		// a hundredth of a block) but far below the real drift's actual per-tick speed (16.1/11.9 blocks over
-		// ~38 ticks is roughly 0.3-0.4 blocks/tick), so genuine movement is still caught on its very first
-		// real tick.
+		Vec3 delta = currentPos.subtract(data.lastPosition);
+
+		// No new position packet this tick (servers only send moves every few ticks, and none at all for a
+		// marker that isn't moving): nothing to sample.
+		if (delta.lengthSqr() == 0.0) {
+			if (wasStationary && data.ticksObserved > 0) data.stationaryTicks++;
+			data.ticksObserved++;
+			return;
+		}
+		data.ticksObserved++;
+		long packetGapMillis = Math.max(50L, currentTickTime - data.lastChangeTime);
+		data.lastChangeTime = currentTickTime;
+		data.lastPosition = currentPos;
+
 		if (delta.lengthSqr() > MIN_REAL_MOVEMENT_SQR) {
-			// See EntityData.consecutiveMovementTicks' own doc comment (the first-wave-of-4 stutter bug): only
-			// counts toward "real movement has begun" once this many ticks in a row have qualified, rejecting
-			// a single spurious client-load-stutter jump.
 			data.consecutiveMovementTicks++;
-			if (data.consecutiveMovementTicks >= REQUIRED_CONSECUTIVE_MOVEMENT_TICKS) {
-				// Real bug found (per user report — "the timers on the blood mobs doesnt seem to reset... its
-				// -15 seconds and keeps adding for each mob"): data.started used to be fixed at whenever this
-				// entity was FIRST DETECTED by the scan above (in the EntityData constructor) — but a spawn-
-				// preview marker can sit visible-but-motionless for several real seconds before Hypixel actually
-				// starts drifting it (that head start is the whole point of a preview marker). getTimeUntilSpawn
-				// computes its countdown off (currentTickTime - data.started), so by the time this entity's box
-				// even starts rendering (gated on real movement below, per the fix above this round), timeTook
-				// already included that whole motionless dwell period — starting the countdown deeply negative
-				// instead of at the real ~2-4 second budget. Reset started to the tick movement ACTUALLY begins,
-				// not whenever the entity was first seen.
-				if (wasStationary) data.started = currentTickTime;
-				// Real bug found (per user report — "spawn boxes are really offset sometimes... way further than
-				// the mob actually goes"): this used to cap deltaHistory at a 20-sample sliding window (an
-				// arbitrary value this port invented — Odin's own real BloodCamp.kt never caps it at all, just
-				// {@code data.deltaHistory.addLast(delta)} for the entity's whole tracked lifetime). With no cap,
-				// summing every recorded delta since tracking began telescopes into exactly (currentPos -
-				// startVector) — i.e. "the straight-line direction from where it started to where it is right
-				// now", which only gets MORE accurate as the mob moves further. Capping the window instead meant
-				// the direction was only ever "the trend over the last ~1 second", which could drift/wobble away
-				// from the true overall direction (e.g. as the drift animation eases toward its final position)
-				// and get scaled by the same fixed 16.1/11.9-block distance regardless — overshooting whenever
-				// the recent-second trend didn't match the real overall direction. Uncapped now, matching Odin.
+			// Like Odin, the drift starts at the FIRST real move packet — the second consecutive one just
+			// confirms it wasn't a one-off resync, and the start is backdated to the first.
+			if (data.consecutiveMovementTicks == 1) data.firstMoveTime = currentTickTime;
+			if (data.consecutiveMovementTicks >= REQUIRED_CONSECUTIVE_MOVEMENT_PACKETS) {
+				if (wasStationary) data.started = data.firstMoveTime;
 				data.deltaHistory.addLast(delta);
 			}
 		} else {
 			data.consecutiveMovementTicks = 0;
 		}
 
-		// Real bug found (per user report — "sees the still heads on the walls as soon as i enter the
-		// bloodroom. Its only supposed to do it for the moving ones"): this used to add every matching
-		// ArmorStand to renderDataMap (and therefore start drawing a box for it) the instant it was found by
-		// the scan above, regardless of whether it had ever actually moved — which is exactly what the
-		// static decorative heads mounted on the walls are: entities with the same allowed-mob-skull
-		// texture that never move at all. Confirmed against Skyblocker's own real BloodCampHelper.java: it
-		// never predicts/renders a mob until it's accumulated real nonzero movement samples (its own
-		// DELTA_SAMPLES gate) — a static entity's delta is always exactly zero, so it never qualifies.
-		// Mirrored here with a simpler "at least one real movement sample observed" gate, skipping the
-		// render-data update (and therefore the box) entirely until the entity has actually started moving.
 		if (data.deltaHistory.isEmpty()) return;
 
-		// Real bug found (per user report — "the timer is now perfect but does not move the box
-		// accordingly. It should detect the movement speed of the head and then do the math on where it
-		// will be when the timer is finished and display the box there"): this used to project the box to a
-		// FIXED total travel distance (16.1/11.9 blocks, Odin's own known real spawn-drift distance) along
-		// the summed direction traveled so far — a box position entirely independent of the countdown timer,
-		// which only converges on the real landing spot once enough of that fixed distance has actually been
-		// covered. Replaced with exactly what was asked: speedVectors (the head's own observed average
-		// velocity) times however many ms getTimeUntilSpawn() says are left, added to the head's CURRENT
-		// live position — recomputed fresh every render frame in renderInner(), so the box continuously
-		// tracks both the head's real position and the countdown's own remaining time.
 		RenderData render = renderDataMap.computeIfAbsent(entity, e -> new RenderData());
-		// Real bug found (per user report, after watching a real recording — "It seems to jump closer and
-		// further like before but now just jumps in bigger chunks, which means the math for the speed is
-		// failing. Can we introduce a curve to cancel it out?"): the previous round's wider display deadzone
-		// only masked the symptom (fewer, bigger snaps instead of constant small creep) without fixing why
-		// the estimate needed correcting at all. The real cause is this cumulative-average formula itself:
-		// `(currentPos - startVector) / timeTook` assumes CONSTANT velocity for the mob's entire drop, but
-		// Hypixel's real drift is an EASED animation (slow at first, accelerating) — early samples are
-		// therefore always genuinely too slow, not just noisy, so the average is a systematic underestimate
-		// that keeps climbing as more (faster) later ticks get folded in. That's exactly "starts with a
-		// prediction, then slowly creeps": not sensor noise, a biased formula assuming the wrong motion model.
-		// Replaced with an exponential moving average of each tick's own INSTANTANEOUS velocity (this real
-		// tick's position delta over one real client tick's wall-clock length — a stable ~50ms regardless of
-		// server-side lag, since updateTracking runs once per real client tick, unlike the lag-scaled
-		// currentTickTime used for countdown scheduling) — the same fix Gemini suggested when asked for a
-		// smoothing curve. An EMA weights RECENT motion far more than old history, so as the real drift
-		// accelerates the estimate tracks the CURRENT speed almost immediately instead of being dragged down
-		// by the slow early ticks for the whole rest of the drop — no separate deadzone/snap step is needed
-		// on the endpoint anymore (see renderInner's own note): a smoothly-updating velocity produces a
-		// smoothly-updating projected endpoint by construction.
-		// Real bug found (per user follow-up — "It jumps around a lot due to tps and such i think. It seems to
-		// jitter a lot in the same place kinda, it just jumps back and forth very fast when starting to move
-		// and when its getting close to the final box"): the EMA above still blended EVERY tick's raw delta
-		// into the estimate, including ticks whose delta is itself just client-side interpolation/network-
-		// timing noise rather than a real movement sample — exactly worst right at the two transitions this
-		// report names: the very start of the drift (a discontinuity as interpolation catches up to the first
-		// real server update) and the very end (the real animation is decelerating toward a stop, so the true
-		// signal shrinks toward the same size as the noise floor). Gated on the same MIN_REAL_MOVEMENT_SQR
-		// threshold already used to decide "has real movement begun" at all: a tick whose delta doesn't clear
-		// it is treated as an unreliable sample and skipped entirely (the estimate holds at whatever it already
-		// was) instead of blending in a near-zero/noisy reading that would otherwise drag the EMA back and
-		// forth every time one of these ticks lands.
 		if (delta.lengthSqr() > MIN_REAL_MOVEMENT_SQR) {
-			Vec3 instantVelocity = new Vec3(delta.x / NOMINAL_CLIENT_TICK_MILLIS, delta.y / NOMINAL_CLIENT_TICK_MILLIS, delta.z / NOMINAL_CLIENT_TICK_MILLIS);
+			// Real elapsed server time between the two packets, not a nominal 50ms tick.
+			Vec3 instantVelocity = delta.scale(1.0 / packetGapMillis);
 			render.speedVectors = render.speedVectors == null ? instantVelocity : new Vec3(
 				instantVelocity.x * VELOCITY_EMA_ALPHA + render.speedVectors.x * (1 - VELOCITY_EMA_ALPHA),
 				instantVelocity.y * VELOCITY_EMA_ALPHA + render.speedVectors.y * (1 - VELOCITY_EMA_ALPHA),
@@ -652,6 +607,7 @@ public class BloodCampFeature extends Feature {
 		render.currVector = currentPos;
 	}
 
+
 	// Per user report ("Blood camp timers do not account for lag"): currentTickTime used to advance a flat
 	// 50ms per client tick, which is correct only at a real 20 server TPS — the Watcher-move/Kill-Mobs
 	// countdown (predTicks*50 after the taunt line, see onChatMessage) and the blood-mob spawn-box prediction
@@ -659,11 +615,22 @@ public class BloodCampFeature extends Feature {
 	// real server lag those server ticks take longer than 50ms of real wall-clock time to actually happen —
 	// so a countdown that just keeps advancing at the normal rate reaches its target before the real event
 	// does. Same fix DungeonTimersFeature.lagAdjustedElapsed() already uses for the identical class of
-	// problem (Purple Pad, Goldor Start, Early Enter, Maxor's crystal window, Necron's lava drop): scale by
-	// the live TpsMonitor estimate, a no-op at a genuine 20 TPS and proportionally slower under real lag.
-	private static long lagAdjustedTickMillis() {
-		double tps = com.cokelord.skyblocksimplified.util.TpsMonitor.getEstimatedTps();
-		return Math.round(50 * (tps / 20.0));
+	// problem (Purple Pad, Goldor Start, Early Enter, Maxor's crystal window, Necron's lava drop): advance by
+	// the server ticks that actually ran (ServerClock), not by a TPS-ratio estimate.
+	private double lastServerTick = Double.NaN;
+
+	/** Server-time ms since the previous client tick, from the server tick clock (ServerClock): 0 while the
+	 *  server is frozen, 50 per real server tick otherwise. Falls back to a flat 50ms before tick data exists. */
+	private long lagAdjustedTickMillis() {
+		double now = com.cokelord.skyblocksimplified.util.ServerClock.tickNow();
+		if (Double.isNaN(now)) return 50L;
+		if (Double.isNaN(lastServerTick) || now < lastServerTick) {
+			lastServerTick = now;
+			return 50L;
+		}
+		long ms = Math.round((now - lastServerTick) * 50.0);
+		lastServerTick = now;
+		return Math.min(ms, 1000L);
 	}
 
 	private long getTimeUntilSpawn(boolean isFirstSpawn, long timeTook) {
@@ -698,7 +665,14 @@ public class BloodCampFeature extends Feature {
 				// earlier than assumeTick/offsetMillis assumed. Bank the leftover time as a correction for
 				// every later prediction this same encounter, so the next box doesn't overshoot the same way.
 				EntityData staleData = entityDataMap.get(entity);
-				if (staleData != null) {
+				// Only a marker watched from standstill, and removed while you're close enough that it can't
+				// just be leaving your entity tracking range, says anything real about a kill-skip. A marker
+				// first seen mid-drift (arrived late / leapt in) has a late start time, and one that unloads
+				// by distance was never "early" — both used to bank up to -2s onto every later timer.
+				Minecraft mcSkew = Minecraft.getInstance();
+				boolean trustworthy = staleData != null && staleData.stationaryTicks >= 2
+					&& mcSkew.player != null && mcSkew.player.distanceToSqr(entity) <= 32 * 32;
+				if (trustworthy) {
 					long staleTimeTook = currentTickTime - staleData.started;
 					long staleTimeLeft = getTimeUntilSpawn(staleData.firstSpawns, staleTimeTook);
 					if (staleTimeLeft > 200L) {
@@ -743,10 +717,15 @@ public class BloodCampFeature extends Feature {
 			// was — the landing spot doesn't change after the countdown ends.
 			long remainingMs = Math.max(0L, time);
 			if (remainingMs > 0L) {
+				// Per user report ("the box doesnt account for the timer and puts itself way more in the center
+				// than it should... the mob spawns way earlier than when it reaches the box"): 1.3.94's Odin-style
+				// fixed landing distance (16.1 / 11.9 blocks) overshoots with our tracking — the same "too far"
+				// seen before. Back to projecting where the head will be when the timer runs out: current
+				// (server-exact) position + measured speed x time left.
 				render.displayedEndPoint = new Vec3(
-					entity.getX() + render.speedVectors.x * remainingMs,
-					entity.getY() + render.speedVectors.y * remainingMs,
-					entity.getZ() + render.speedVectors.z * remainingMs);
+					render.currVector.x + render.speedVectors.x * remainingMs,
+					render.currVector.y + render.speedVectors.y * remainingMs,
+					render.currVector.z + render.speedVectors.z * remainingMs);
 			}
 			Vec3 endPoint = render.displayedEndPoint;
 
@@ -880,6 +859,32 @@ public class BloodCampFeature extends Feature {
 	// ---- getters/setters ----
 	public boolean isMovePrediction() { return movePrediction; }
 	public void setMovePrediction(boolean value) { movePrediction = value; }
+	static String watcherSpeedName(long predTicks) {
+		return predTicks <= 27 ? "Fast" : predTicks <= 30 ? "Normal" : "Slow";
+	}
+
+	private void announceWatcherSpeed(Minecraft mc, long predTicks) {
+		if (mc.player == null) return;
+		String speed = watcherSpeedName(predTicks);
+		String color = switch (speed) { case "Fast" -> "§a"; case "Normal" -> "§e"; default -> "§c"; };
+		if (watcherSpeedTitle) {
+			mc.gui.hud.setTimes(5, 40, 10);
+			mc.gui.hud.setTitle(Component.literal(color + "§l" + speed + " Watcher!"));
+			if (watcherSpeedSoundEnabled) watcherSpeedSound.play();
+		}
+		if (watcherSpeedParty && mc.player.connection != null) {
+			mc.player.connection.sendCommand("pc " + speed + " Watcher! (moves in " + fmt(predTicks / 20f) + "s)");
+		}
+	}
+
+	public boolean isWatcherSpeedTitle() { return watcherSpeedTitle; }
+	public void setWatcherSpeedTitle(boolean value) { watcherSpeedTitle = value; }
+	public boolean isWatcherSpeedParty() { return watcherSpeedParty; }
+	public void setWatcherSpeedParty(boolean value) { watcherSpeedParty = value; }
+	public boolean isWatcherSpeedSoundEnabled() { return watcherSpeedSoundEnabled; }
+	public void setWatcherSpeedSoundEnabled(boolean value) { watcherSpeedSoundEnabled = value; }
+	public com.cokelord.skyblocksimplified.sound.CustomSoundOption getWatcherSpeedSound() { return watcherSpeedSound; }
+
 	public boolean isPartyMoveTime() { return partyMoveTime; }
 	public void setPartyMoveTime(boolean value) { partyMoveTime = value; }
 	public boolean isKillTitle() { return killTitle; }
@@ -916,6 +921,10 @@ public class BloodCampFeature extends Feature {
 		JsonObject obj = new JsonObject();
 		obj.addProperty("movePrediction", movePrediction);
 		obj.addProperty("partyMoveTime", partyMoveTime);
+		obj.addProperty("watcherSpeedTitle", watcherSpeedTitle);
+		obj.addProperty("watcherSpeedParty", watcherSpeedParty);
+		obj.addProperty("watcherSpeedSoundEnabled", watcherSpeedSoundEnabled);
+		obj.add("watcherSpeedSound", watcherSpeedSound.toJson());
 		obj.addProperty("killTitle", killTitle);
 		obj.addProperty("bloodAssist", bloodAssist);
 		obj.addProperty("spawnColor", spawnColor);
@@ -940,6 +949,10 @@ public class BloodCampFeature extends Feature {
 		JsonObject obj = el.getAsJsonObject();
 		if (obj.has("movePrediction")) movePrediction = obj.get("movePrediction").getAsBoolean();
 		if (obj.has("partyMoveTime")) partyMoveTime = obj.get("partyMoveTime").getAsBoolean();
+		if (obj.has("watcherSpeedTitle")) watcherSpeedTitle = obj.get("watcherSpeedTitle").getAsBoolean();
+		if (obj.has("watcherSpeedParty")) watcherSpeedParty = obj.get("watcherSpeedParty").getAsBoolean();
+		if (obj.has("watcherSpeedSoundEnabled")) watcherSpeedSoundEnabled = obj.get("watcherSpeedSoundEnabled").getAsBoolean();
+		if (obj.has("watcherSpeedSound")) watcherSpeedSound.fromJson(obj.get("watcherSpeedSound"));
 		if (obj.has("killTitle")) killTitle = obj.get("killTitle").getAsBoolean();
 		if (obj.has("bloodAssist")) bloodAssist = obj.get("bloodAssist").getAsBoolean();
 		if (obj.has("spawnColor")) spawnColor = obj.get("spawnColor").getAsInt();

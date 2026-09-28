@@ -111,6 +111,10 @@ public class InstanceChestProfitFeature extends Feature {
 			pendingScreen = null;
 			return;
 		}
+		// Per user report ("The instance chest profit also does not show anymore"): while Chest Rolling is
+		// blanking/rolling this screen, computeText bails out — it used to do that once and give up for good
+		// (Chest Rolling now blanks an unprocessed chest from its first frame). Wait until the real screen shows.
+		if (ChestRollingFeature.shouldReplaceRender(pendingScreen)) return;
 		boolean hasAnyItem = false;
 		var allSlots = pendingScreen.getMenu().slots;
 		int containerSlotCount = Math.max(0, allSlots.size() - 36);

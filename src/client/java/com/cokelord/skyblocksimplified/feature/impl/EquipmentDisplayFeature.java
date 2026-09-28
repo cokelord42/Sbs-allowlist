@@ -153,7 +153,7 @@ public class EquipmentDisplayFeature extends Feature {
 			// equipment icon jumps straight to the real Stats & Equipment screen, the same command convention
 			// this codebase already uses everywhere else (sendCommand with no leading slash).
 			ScreenMouseEvents.allowMouseClick(screen).register((s, event) -> {
-				if (!isEnabled()) return true;
+				if (!isEnabled() || NeuStyleButtonsFeature.isEditingForm()) return true;
 				for (int[] b : iconBounds) {
 					if (event.x() >= b[0] && event.x() <= b[2] && event.y() >= b[1] && event.y() <= b[3]) {
 						Minecraft mc = Minecraft.getInstance();
@@ -179,13 +179,31 @@ public class EquipmentDisplayFeature extends Feature {
 		}
 	}
 
+	// Real lag source found (per user report — "something is lagging my game a lot in the stats menu"): capture
+	// runs from an afterExtract hook, i.e. EVERY rendered frame, and used to copy all 4 stacks and synchronously
+	// write the compressed NBT cache file to disk every single frame the menu was open. Now it only copies/saves
+	// when a slot's stack actually changed — reference check first (free), full component compare only when
+	// the server replaced the object.
+	private final ItemStack[] lastSeen = new ItemStack[4];
+
+	private boolean changed(int index, ItemStack live) {
+		if (lastSeen[index] == live) return false;
+		lastSeen[index] = live;
+		ItemStack cached = cachedGear[index];
+		return cached == null || !ItemStack.matches(cached, live);
+	}
+
 	private void captureFixedSlots(AbstractContainerScreen<?> screen) {
 		var menu = screen.getMenu();
 		if (menu.slots.size() <= SLOT_GLOVES) return;
+		boolean dirty = false;
 		for (int i = 0; i < EQUIPMENT_SLOTS.length; i++) {
 			ItemStack stack = menu.getSlot(EQUIPMENT_SLOTS[i]).getItem();
+			if (!changed(i, stack)) continue;
 			cachedGear[i] = stack.isEmpty() ? ItemStack.EMPTY : stack.copy();
+			dirty = true;
 		}
+		if (!dirty) return;
 		everCaptured = true;
 		saveToDisk();
 	}
@@ -206,12 +224,16 @@ public class EquipmentDisplayFeature extends Feature {
 		if (selectedColumn < 0) return;
 		// Row 5 (0-indexed row 4) is WARDROBE_ROW5_START + column; the 4 rows directly above it (0-indexed
 		// rows 0-3) start at plain `column` in row 0 and step by one row (9 slots) per accessory.
+		boolean dirty = false;
 		for (int i = 0; i < WARDROBE_ROWS_ABOVE; i++) {
 			int slot = selectedColumn + i * WARDROBE_ROW_STRIDE;
 			if (slot < 0 || slot >= menu.slots.size()) return;
 			ItemStack stack = menu.getSlot(slot).getItem();
+			if (!changed(i, stack)) continue;
 			cachedGear[i] = stack.isEmpty() ? ItemStack.EMPTY : stack.copy();
+			dirty = true;
 		}
+		if (!dirty) return;
 		everCaptured = true;
 		saveToDisk();
 	}
@@ -326,7 +348,12 @@ public class EquipmentDisplayFeature extends Feature {
 	// look every other slot-shaped UI in this mod already uses — e.g. StorageOverlayFeature's own reserved-
 	// inventory cells), drawn for all 4 accessory types even before anything's been captured yet, so this
 	// reads as 4 real equipment slots rather than 4 icons floating in empty space.
-	private static final int SLOT_BG_COLOR = 0xFF1A1A1A;
+	//
+	// Real bug found (per user report — "the equipment display background should be transparent, currently
+	// it just makes a black box for some reason"): alpha 0xFF is fully OPAQUE — this was never a translucent
+	// inset at all, just a solid black square painted behind every icon. Dropped to the same 0x60 alpha
+	// ItemRarityBackgroundFeature's own slot fill already uses, a real subtle inset instead of a solid box.
+	private static final int SLOT_BG_COLOR = 0x601A1A1A;
 	private static final int SLOT_PADDING = 1;
 
 	private void render(GuiGraphicsExtractor graphics, InventoryScreen screen, int mouseX, int mouseY) {

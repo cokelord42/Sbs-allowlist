@@ -89,6 +89,7 @@ public final class SkyblockItemRepo {
 
 			Map<String, ItemInfo> next = new HashMap<>();
 			Map<String, String> nextNames = new HashMap<>();
+			Map<String, JsonObject> nextUpgrades = new HashMap<>();
 			for (JsonElement el : itemsEl.getAsJsonArray()) {
 				JsonObject item = el.getAsJsonObject();
 				JsonElement idEl = item.get("id");
@@ -105,15 +106,32 @@ public final class SkyblockItemRepo {
 				String itemModel = item.has("item_model") ? item.get("item_model").getAsString() : null;
 				Integer leatherColor = parseLeatherColor(item);
 				next.put(id, new ItemInfo(id, name, category, tier, npcSellPrice, recipe, material, skinTexture, itemModel, skinSignature, leatherColor));
+				// Player Viewer networth: star upgrade costs, dungeon conversion cost and gemstone slot unlock costs
+				// (kept raw — only a small fraction of items carry them).
+				if (item.has("upgrade_costs") || item.has("gemstone_slots") || item.has("dungeon_item_conversion_cost")) {
+					JsonObject upgrades = new JsonObject();
+					for (String key : new String[]{"upgrade_costs", "gemstone_slots", "dungeon_item_conversion_cost"}) {
+						if (item.has(key)) upgrades.add(key, item.get(key));
+					}
+					nextUpgrades.put(id, upgrades);
+				}
 				nextNames.putIfAbsent(normalizeName(name), id);
 			}
 			ITEMS.putAll(next);
 			NAME_TO_ID.putAll(nextNames);
+			UPGRADES.putAll(nextUpgrades);
 			SkyblockSimplified.LOGGER.info("Loaded {} items from the Hypixel Skyblock item repo", next.size());
 		}).exceptionally(e -> {
 			SkyblockSimplified.LOGGER.warn("Failed to refresh the Hypixel Skyblock item repo", e);
 			return null;
 		});
+	}
+
+	private static final Map<String, JsonObject> UPGRADES = new ConcurrentHashMap<>();
+
+	/** Raw {@code upgrade_costs}/{@code gemstone_slots}/{@code dungeon_item_conversion_cost} for an item, or null. */
+	public static JsonObject getUpgradeData(String id) {
+		return UPGRADES.get(id);
 	}
 
 	/** Null if the id is unknown or the repo hasn't loaded yet. */

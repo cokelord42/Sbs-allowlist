@@ -12,14 +12,20 @@ import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
 import net.minecraft.resources.Identifier;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FlowerPotBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
  * Per user request: generalizes the old "Purple Pad Timer" (formerly a lone toggle inside Dungeon
@@ -120,6 +126,28 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 	// TerminalSection tracking) — reused directly here instead of adding a second, redundant chat listener.
 	private static final long GOLDOR_START_COUNTDOWN_MILLIS = 5_200L;
 
+	// Per user request ("Fold the new storm pad timer into dungeon timers. Add its subtoggles (color code,
+	// bold, everything else) into it aswell. Make sure that timers stack..."): the standalone Storm Pad Timer
+	// module (a repeating 20-tick countdown for Storm's purple pad, ported from Odin's own TickTimers.kt —
+	// see its own former class doc comment for the full mechanic) folded in here as just another candidate
+	// line in activeLines(), so it automatically gets this panel's existing dynamic stacking for free instead
+	// of being a second, uncoordinated floating widget. Distinct name from stormPadTimerEnabled above (this
+	// panel's OWN pre-existing "27s delay + 5s countdown, fires once" purple-pad predictor) — these are two
+	// genuinely different mechanics that happen to both be about the same purple pad, not a rename.
+	private boolean stormPadTickTimerEnabled = true;
+	// Per user request ("Remove the hex picker and storm pad tick: bold text and italic text subtoggles"):
+	// the tick timer's own dedicated style/color settings are gone — its "Pad: " label is now a fixed cyan
+	// and it follows this panel's shared Bold/Italic Text toggles like every other line.
+	private static final int STORM_PAD_TICK_LABEL_COLOR = 0xFF55FFFF;
+	private static final int TICK_COLOR_HIGH = 0xFF55FF55;
+	private static final int TICK_COLOR_MID = 0xFFFFFF55;
+	private static final int TICK_COLOR_LOW = 0xFFFF5555;
+	// Same real line DungeonNotificationsFeature's own STORM_CRUSHED type already fires on — duplicated here
+	// rather than shared, matching this codebase's established convention for small, self-contained per-
+	// feature logic (see e.g. PetDisplayFeature/MelodyDisplayFeature's own duplicated classIcon()).
+	private static final Pattern STORM_CRUSHED_PATTERN = Pattern.compile("^\\[BOSS] Storm: (Oof|Ouch, that hurt!?)");
+	private int stormCrushCount = 0;
+
 	private boolean stormPadTimerEnabled = true;
 	private boolean terminalsTimerEnabled = true;
 	private boolean goldorLoopEnabled = true;
@@ -127,6 +155,37 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 	private boolean necronWarningEnabled = true;
 	private boolean maxorCrystalTimerEnabled = true;
 	private boolean goldorStartTimerEnabled = true;
+
+	// Per user request ("Terracotta respawn timers... detect when the user enters the floor 6 bossfight, and
+	// detect when dirt blocks appear in the arena. When they do appear it needs to place a timer above them
+	// counting down from 12" / "Terracotta spawn timer... count down from 12 when entering the floor 6
+	// bossfight"). 12s is the user's own figure. A dead Terracotta's marker block is detected off real
+	// server block updates (ClientLevelBlockUpdateMixin — both single and multi-block update packets funnel
+	// through ClientLevel#setServerVerifiedBlockState, confirmed by decompiling ClientPacketListener).
+	// Matches dirt (user-confirmed) and any potted plant — Odin's own TerracottaTimer.kt keys off a flower
+	// pot appearing at the same spot, so both are accepted and deduplicated by position.
+	private static final long TERRACOTTA_RESPAWN_MILLIS = 12_000L;
+	// Per user: the spawn countdown runs one second longer than the respawn one.
+	private static final long TERRACOTTA_SPAWN_MILLIS = 13_300L;
+	private static final double TERRACOTTA_DEDUP_DIST_SQ = 1.5 * 1.5;
+	private boolean terracottaRespawnTimersEnabled = true;
+	private boolean terracottaSpawnTimerEnabled = true;
+	// Per user request: Last Breath charge timer for Storm. Draw back at 29.60 on the Storm split, release at
+	// 34.60 (5.00s countdown), with a box at the spot to shoot. Uses the raw split time (not lag-adjusted) so
+	// it matches exactly what the Splits display reads, which is what the user timed it against.
+	private static final long LAST_BREATH_DRAW_MILLIS = 29_600L;
+	private static final long LAST_BREATH_RELEASE_MILLIS = 34_600L;
+	private static final long LAST_BREATH_LINGER_MILLIS = 1_000L;
+	private static final net.minecraft.world.phys.AABB LAST_BREATH_BOX = new net.minecraft.world.phys.AABB(new BlockPos(98, 183, 63));
+	private boolean lastBreathTimerEnabled = true;
+	private int lastBreathBoxColor = 0xFFFF55FF;
+	private static boolean lastBreathBoxRegistered = false;
+	private record TerracottaTimer(Vec3 labelPos, long startMillis) {}
+	// Only ever touched on the client main thread (packet handling runs there via ensureRunningOnSameThread,
+	// same as onTick/render), so a plain list is safe.
+	private final List<TerracottaTimer> terracottaTimers = new ArrayList<>();
+	private boolean wasInF6Boss = false;
+	private Long f6BossEnteredMillis = null;
 	// Per user request ("let users pick the type of text they want for the timers"): both off by default,
 	// matching the plain unstyled look every line already has.
 	private boolean boldText = false;
@@ -195,9 +254,22 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 	protected void onEnable() {
 		if (listenersRegistered) return;
 		listenersRegistered = true;
+		net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+			if (instance != null && instance.isEnabled() && DungeonState.isInBoss() && DungeonState.isFloor(7)
+				&& STORM_CRUSHED_PATTERN.matcher(message.getString()).find()) {
+				instance.stormCrushCount++;
+			}
+			return true;
+		});
+		if (!lastBreathBoxRegistered) {
+			lastBreathBoxRegistered = true;
+			com.cokelord.skyblocksimplified.highlight.World3DRenderer.addRenderCallback(DungeonTimersFeature::renderLastBreathBox);
+		}
 		HudElementRegistry.attachElementBefore(net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements.PLAYER_LIST, Identifier.fromNamespaceAndPath("skyblocksimplified", "dungeon_timers"), (graphics, tracker) -> {
-			if (instance == null || !instance.isVisible() || com.cokelord.skyblocksimplified.hud.DebugScreenGate.isOpen()
+			if (instance == null || !instance.isEnabled() || com.cokelord.skyblocksimplified.hud.DebugScreenGate.isOpen()
 				|| com.cokelord.skyblocksimplified.hud.ChatOverlapUtil.isBlockingScreen()) return;
+			instance.drawTerracottaTimers(graphics);
+			if (!instance.isVisible()) return;
 			Minecraft mc = Minecraft.getInstance();
 			int x = Math.round(instance.position.anchorX * mc.getWindow().getGuiScaledWidth());
 			int y = Math.round(instance.position.anchorY * mc.getWindow().getGuiScaledHeight());
@@ -213,13 +285,33 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 				stormPhaseStartMillis = null;
 				lastTerminalSection = DungeonState.TerminalSection.NONE;
 				goldorBoundariesFired = 0L;
+				stormCrushCount = 0;
 			}
+			resetTerracotta();
 			return;
 		}
+
+		boolean inF6Boss = DungeonState.isInBoss() && DungeonState.isFloor(6);
+		if (inF6Boss != wasInF6Boss) {
+			wasInF6Boss = inF6Boss;
+			if (inF6Boss) {
+				f6BossEnteredMillis = System.currentTimeMillis();
+			} else {
+				resetTerracotta();
+			}
+		}
+		// Per user: the respawn timers end once the Giants split starts (Terracottas no longer respawn).
+		if (!terracottaTimers.isEmpty() && SplitsFeature.millisSinceSplit("Giants") != null) terracottaTimers.clear();
+		if (!terracottaTimers.isEmpty()) {
+			long now = System.currentTimeMillis();
+			terracottaTimers.removeIf(t -> lagAdjustedElapsed(now - t.startMillis()) >= TERRACOTTA_RESPAWN_MILLIS);
+		}
+		rebuildTerracottaLabels();
 
 		DungeonState.F7Phase phase = DungeonState.getF7Phase();
 		if (phase != lastF7Phase) {
 			stormPhaseStartMillis = phase == DungeonState.F7Phase.P2 ? System.currentTimeMillis() : null;
+			if (phase == DungeonState.F7Phase.P2) stormCrushCount = 0;
 			lastF7Phase = phase;
 		}
 
@@ -255,17 +347,84 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 	// wall-clock elapsed time since a chat-line anchor. That's correct under normal 20-TPS play, but during
 	// real server lag the underlying server-side event itself runs behind schedule too — a countdown that
 	// just keeps counting real seconds reaches 0 (or fires a boundary) before the real event has actually
-	// happened, exactly the "misaligns"/"wrong timings" report. TpsMonitor (already used elsewhere in this
-	// codebase for the same class of server-lag compensation, e.g. TerminalTracker's click grace window)
-	// gives a live best-effort server TPS estimate off real ClientboundSetTimePacket spacing — scaling
-	// elapsed real time by (estimatedTps / 20.0) converts it into "server-tick-equivalent" elapsed time: at
-	// full 20 TPS this is a no-op (ratio 1.0), and under lag it slows proportionally, keeping these
-	// countdowns in sync with the real, slowed-down schedule instead of a fixed real-time one. Deliberately
+	// happened, exactly the "misaligns"/"wrong timings" report. ServerClock converts the real interval into
+	// the server ticks that actually ran during it (from ClientboundSetTimePacket game times), so under lag
+	// these countdowns pause for exactly the lost ticks instead of scaling by a TPS guess. Deliberately
 	// NOT applied to terminalsLine() (a genuine up-counting stopwatch of real elapsed time, not a
 	// prediction) or stormLightningLine() (driven directly by a live title packet, not a local guess).
 	private static long lagAdjustedElapsed(long realElapsedMillis) {
-		double tps = com.cokelord.skyblocksimplified.util.TpsMonitor.getEstimatedTps();
-		return Math.round(realElapsedMillis * (tps / 20.0));
+		// Server tick clock (see ServerClock): counts the ticks the server actually processed, so a timer
+		// pauses exactly for the ticks lost to lag instead of scaling everything by the current TPS guess.
+		return com.cokelord.skyblocksimplified.util.ServerClock.elapsedMillis(realElapsedMillis);
+	}
+
+	private void resetTerracotta() {
+		wasInF6Boss = false;
+		f6BossEnteredMillis = null;
+		terracottaTimers.clear();
+		terracottaLabels = List.of();
+	}
+
+	/** Called from ClientLevelBlockUpdateMixin for every server-sent block change. Cheapest checks first —
+	 *  this fires for every block update anywhere, so the block-type test runs before any state lookup. */
+	public static void onServerBlockChange(net.minecraft.client.multiplayer.ClientLevel level, BlockPos pos, BlockState newState) {
+		DungeonTimersFeature f = instance;
+		if (f == null || !f.terracottaRespawnTimersEnabled || !f.wasInF6Boss || !f.isEnabled() || !isTerracottaMarker(newState)) return;
+		if (isTerracottaMarker(level.getBlockState(pos))) return;
+		if (SplitsFeature.millisSinceSplit("Giants") != null) return;
+		Vec3 labelPos = new Vec3(pos.getX() + 0.5, pos.getY() + 1.5, pos.getZ() + 0.5);
+		for (TerracottaTimer t : f.terracottaTimers) {
+			double dx = t.labelPos().x - labelPos.x, dz = t.labelPos().z - labelPos.z;
+			if (dx * dx + dz * dz <= TERRACOTTA_DEDUP_DIST_SQ && Math.abs(t.labelPos().y - labelPos.y) <= 2) return;
+		}
+		f.terracottaTimers.add(new TerracottaTimer(labelPos, System.currentTimeMillis()));
+	}
+
+	private static boolean isTerracottaMarker(BlockState state) {
+		return state.is(Blocks.DIRT) || state.getBlock() instanceof FlowerPotBlock;
+	}
+
+	/** Per user spec: whole seconds 12-8 green, 7-4 yellow, 3-0 red (by the integer part shown). */
+	private static String countdownColor(float remainingSeconds) {
+		if (remainingSeconds >= 8f) return "§a";
+		if (remainingSeconds >= 4f) return "§e";
+		return "§c";
+	}
+
+	// Per user report ("Terras still lag a little when a lot die at the same time"): labels are built once per
+	// client tick (server-clock math + formatting per timer) and each frame only projects and draws them.
+	// The countdown shows one decimal, so per-tick (50ms) text updates look identical.
+	private record TerracottaLabel(Vec3 pos, String text) {}
+	private List<TerracottaLabel> terracottaLabels = List.of();
+
+	private void rebuildTerracottaLabels() {
+		if (terracottaTimers.isEmpty()) { terracottaLabels = List.of(); return; }
+		long now = System.currentTimeMillis();
+		String style = stylePrefix();
+		List<TerracottaLabel> labels = new ArrayList<>(terracottaTimers.size());
+		for (TerracottaTimer t : terracottaTimers) {
+			float remaining = Math.max(0f, (TERRACOTTA_RESPAWN_MILLIS - lagAdjustedElapsed(now - t.startMillis())) / 1000f);
+			labels.add(new TerracottaLabel(t.labelPos(), countdownColor(remaining) + style + String.format(Locale.ROOT, "%.1f", remaining)));
+		}
+		terracottaLabels = labels;
+	}
+
+	private void drawTerracottaTimers(GuiGraphicsExtractor graphics) {
+		for (TerracottaLabel label : terracottaLabels) {
+			com.cokelord.skyblocksimplified.highlight.WorldRenderUtil.drawTextNoOcclusion(graphics, label.text(), label.pos(), 0xFFFFFFFF);
+		}
+	}
+
+	private float terracottaSpawnRemaining() {
+		if (!terracottaSpawnTimerEnabled || f6BossEnteredMillis == null) return -1f;
+		long elapsed = lagAdjustedElapsed(com.cokelord.skyblocksimplified.gui.HudEditScreen.previewNowMillis() - f6BossEnteredMillis);
+		return elapsed < TERRACOTTA_SPAWN_MILLIS ? (TERRACOTTA_SPAWN_MILLIS - elapsed) / 1000f : -1f;
+	}
+
+	private String terracottaSpawnLine() {
+		float remaining = terracottaSpawnRemaining();
+		if (remaining < 0f) return null;
+		return "§6Terracotta: " + countdownColor(remaining) + String.format(Locale.ROOT, "%.1f", remaining) + "s";
 	}
 
 	private String purplePadLine() {
@@ -376,16 +535,84 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 		return elapsed >= 0 && elapsed < GOLDOR_START_COUNTDOWN_MILLIS;
 	}
 
-	private List<String> activeLines() {
-		List<String> lines = new ArrayList<>(6);
-		String pad = purplePadLine(); if (pad != null) lines.add(pad);
-		String term = terminalsLine(); if (term != null) lines.add(term);
-		String goldorStart = goldorStartLine(); if (goldorStart != null) lines.add(goldorStart);
-		String goldor = goldorLoopLine(); if (goldor != null) lines.add(goldor);
-		String necron = necronLine(); if (necron != null) lines.add(necron);
-		String maxor = maxorCrystalLine(); if (maxor != null) lines.add(maxor);
-		String lightning = stormLightningLine(); if (lightning != null) lines.add(lightning);
+	// Per user request ("Fold the new storm pad timer into dungeon timers... Make sure that timers stack when
+	// multiple are on screen, so if another timer pops up it goes to the next line... until the other timer
+	// is gone and then it goes to first line"): every other line here is already a single plain string with
+	// its own colors baked in as legacy "§" codes — the tick timer needs a genuinely separate custom RGB
+	// color for its "Pad: " label vs. its number (and the number's own color can additionally be a live
+	// threshold color, not a fixed one at all), which a single legacy-code string can't express. Both prefix
+	// and suffix already carry their own resolved style-code prefix (bold/italic) baked in at construction
+	// time, so drawPanel/renderLines below never need to know which "kind" of source line produced them.
+	private record TimerLine(String prefixText, int prefixColor, String suffixText, int suffixColor) {}
+
+	/** Wraps one of this panel's existing single-string legacy-coded lines (all colors embedded as "§"
+	 *  codes) into a {@link TimerLine} with an empty, invisible prefix — this panel's own shared boldText/
+	 *  italicText stylePrefix is baked into the (only) suffix segment, same as every one of these lines
+	 *  already had applied to it before this fold-in. */
+	private TimerLine plainLine(String legacyText) {
+		return new TimerLine("", 0xFFFFFFFF, stylePrefix() + legacyText, 0xFFFFFFFF);
+	}
+
+	private String stylePrefix() {
+		return boldText ? (italicText ? "§l§o" : "§l") : (italicText ? "§o" : "");
+	}
+
+	private List<TimerLine> activeLines() {
+		List<TimerLine> lines = new ArrayList<>(8);
+		String pad = purplePadLine(); if (pad != null) lines.add(plainLine(pad));
+		TimerLine tick = stormPadTickLine(); if (tick != null) lines.add(tick);
+		String term = terminalsLine(); if (term != null) lines.add(plainLine(term));
+		String goldorStart = goldorStartLine(); if (goldorStart != null) lines.add(plainLine(goldorStart));
+		String goldor = goldorLoopLine(); if (goldor != null) lines.add(plainLine(goldor));
+		String necron = necronLine(); if (necron != null) lines.add(plainLine(necron));
+		String relic = relicLine(); if (relic != null) lines.add(plainLine(relic));
+		String maxor = maxorCrystalLine(); if (maxor != null) lines.add(plainLine(maxor));
+		String lightning = stormLightningLine(); if (lightning != null) lines.add(plainLine(lightning));
+		String terracotta = terracottaSpawnLine(); if (terracotta != null) lines.add(plainLine(terracotta));
+		Long sinceStorm = lastBreathElapsed();
+		if (sinceStorm != null) {
+			boolean released = sinceStorm >= LAST_BREATH_RELEASE_MILLIS;
+			float remaining = Math.max(0f, (LAST_BREATH_RELEASE_MILLIS - sinceStorm) / 1000f);
+			lines.add(plainLine(released ? "§a§lRelease!" : "§eDraw back..."));
+			lines.add(plainLine((released ? "§a" : "§f") + String.format(Locale.ROOT, "%.2f", remaining) + "s"));
+		}
 		return lines;
+	}
+
+	/** {@link #stormPadTickLine}'s own three-bucket thresholds, per the original Storm Pad Timer module's
+	 *  exact user spec ("15-20 is lime green, 5-15 is yellow, 0-5 is red") — inclusive on each bucket's
+	 *  lower bound, same convention this codebase's other threshold-colored readouts already use (e.g.
+	 *  DungeonMapFeature's own cryptsColor). Per user request ("Force the color coding for the storm pad
+	 *  tick timer"): this is now the number's only possible color — the old opt-out toggle (which fell back
+	 *  to the flat Text Color instead) is gone. */
+	private static int tickColor(int value) {
+		if (value >= 15) return TICK_COLOR_HIGH;
+		if (value >= 5) return TICK_COLOR_MID;
+		return TICK_COLOR_LOW;
+	}
+
+	/** Real, repeating 20-tick countdown for Storm's purple pad — ported as-is from the old standalone Storm
+	 *  Pad Timer module (see its own former class doc comment for the full "why a repeating sawtooth"
+	 *  reasoning and the Odin TickTimers.kt cross-check). Reuses stormPhaseStartMillis/lastF7Phase directly —
+	 *  the same "when did Storm's phase start" anchor this panel's own pre-existing Purple Pad predictor
+	 *  above already tracks, no separate state needed for that half of it. */
+	private int computeStormPadTickValue() {
+		long adjusted = lagAdjustedElapsed(com.cokelord.skyblocksimplified.gui.HudEditScreen.previewNowMillis() - stormPhaseStartMillis);
+		long msIntoSecond = adjusted % 1000L;
+		int value = 20 - Math.round(msIntoSecond / 50f);
+		return Math.max(0, Math.min(20, value));
+	}
+
+	private boolean stormPadTickActive() {
+		return stormPadTickTimerEnabled && stormPhaseStartMillis != null && stormCrushCount < 2
+			&& DungeonState.getStormDeathSeenAtMillis() == null;
+	}
+
+	private TimerLine stormPadTickLine() {
+		if (!stormPadTickActive()) return null;
+		int value = computeStormPadTickValue();
+		String style = stylePrefix();
+		return new TimerLine(style + "Pad: ", STORM_PAD_TICK_LABEL_COLOR, style + value, tickColor(value));
 	}
 
 	// Cheap yes/no mirrors of purplePadLine()/terminalsLine()/goldorLoopLine() with no String.format or
@@ -420,9 +647,41 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 		return sinceNecron != null && lagAdjustedElapsed(sinceNecron) < NECRON_WARNING_THRESHOLD_MILLIS;
 	}
 
+	/** Per user request: M7 relics spawn 2.1s after the "Cleared" split (Necron dead). The toggle is linked to
+	 *  the Relic Utility module (see RelicUtilityFeature#isLinkedEnabled). */
+	private String relicLine() {
+		if (!isRelicTimerEnabled()) return null;
+		long remaining = com.cokelord.skyblocksimplified.dungeon.m7.M7Relics.spawnRemainingMillis();
+		if (remaining < 0) return null;
+		return "§3Relic: " + countdownColor(remaining / 1000f) + String.format(Locale.ROOT, "%.2f", remaining / 1000f) + "s";
+	}
+
+	public boolean isRelicTimerEnabled() { return com.cokelord.skyblocksimplified.feature.impl.m7.RelicUtilityFeature.isLinkedEnabled(); }
+	public void setRelicTimerEnabled(boolean value) { com.cokelord.skyblocksimplified.feature.impl.m7.RelicUtilityFeature.setLinkedEnabled(value); }
+
 	private boolean hasAnyLine() {
-		return purplePadActive() || terminalsActive() || goldorStartActive() || goldorLoopActive() || necronActive()
-			|| maxorCrystalActive() || stormLightningLine() != null;
+		return relicLine() != null || purplePadActive() || stormPadTickActive() || terminalsActive() || goldorStartActive() || goldorLoopActive()
+			|| necronActive() || maxorCrystalActive() || stormLightningLine() != null || terracottaSpawnRemaining() >= 0f
+			|| lastBreathElapsed() != null;
+	}
+
+	/** Server-time elapsed since the Storm split while the Last Breath window (29.60s draw -> 34.60s release,
+	 *  +1s linger) is live, else null. Runs on the server tick clock (per user: must slow during lag). */
+	private Long lastBreathElapsed() {
+		if (!lastBreathTimerEnabled) return null;
+		Long sinceStorm = SplitsFeature.millisSinceSplit("Storm");
+		if (sinceStorm == null) return null;
+		long elapsed = lagAdjustedElapsed(sinceStorm);
+		if (elapsed < LAST_BREATH_DRAW_MILLIS || elapsed >= LAST_BREATH_RELEASE_MILLIS + LAST_BREATH_LINGER_MILLIS) return null;
+		return elapsed;
+	}
+
+	private static void renderLastBreathBox() {
+		DungeonTimersFeature f = instance;
+		if (f == null || !f.isEnabled() || f.lastBreathElapsed() == null) return;
+		int color = f.lastBreathBoxColor;
+		com.cokelord.skyblocksimplified.highlight.World3DRenderer.drawFilledBoxThroughWalls(LAST_BREATH_BOX, (0x50 << 24) | (color & 0xFFFFFF));
+		com.cokelord.skyblocksimplified.highlight.World3DRenderer.drawWireBoxThroughWalls(LAST_BREATH_BOX, color | 0xFF000000, 2f);
 	}
 
 	@Override
@@ -442,17 +701,16 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 
 	@Override
 	public Size render(GuiGraphicsExtractor graphics, int x, int y, float scale) {
-		List<String> lines = activeLines();
-		if (lines.isEmpty()) lines = List.of("§6§lDungeon Timers", "§7(none active)");
+		List<TimerLine> lines = activeLines();
+		if (lines.isEmpty()) lines = List.of(plainLine("§6§lDungeon Timers"), plainLine("§7(none active)"));
 		return renderLines(graphics, x, y, scale, lines);
 	}
 
-	private Size renderLines(GuiGraphicsExtractor graphics, int x, int y, float scale, List<String> lines) {
+	private Size renderLines(GuiGraphicsExtractor graphics, int x, int y, float scale, List<TimerLine> lines) {
 		Font font = Minecraft.getInstance().font;
 
-		String stylePrefix = (boldText ? "§l" : "") + (italicText ? "§o" : "");
 		int maxWidth = 0;
-		for (String line : lines) maxWidth = Math.max(maxWidth, font.width(stylePrefix + line));
+		for (TimerLine line : lines) maxWidth = Math.max(maxWidth, font.width(line.prefixText()) + font.width(line.suffixText()));
 		int panelWidth = maxWidth + 12;
 		int panelHeight = lines.size() * (font.lineHeight + 2) + 8;
 
@@ -471,11 +729,12 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 
 	// Per user request ("why does the dungeon timer have a background? Remove it.") — plain text now, no
 	// panel fill, matching how the Invincibility Timer/Secrets Counter already render.
-	private void drawPanel(GuiGraphicsExtractor graphics, Font font, int x, int y, List<String> lines, int panelWidth, int panelHeight) {
+	private void drawPanel(GuiGraphicsExtractor graphics, Font font, int x, int y, List<TimerLine> lines, int panelWidth, int panelHeight) {
 		int lineY = y + 4;
-		String stylePrefix = (boldText ? "§l" : "") + (italicText ? "§o" : "");
-		for (String line : lines) {
-			graphics.text(font, stylePrefix + line, x + 6, lineY, 0xFFFFFFFF);
+		for (TimerLine line : lines) {
+			int prefixWidth = font.width(line.prefixText());
+			if (!line.prefixText().isEmpty()) graphics.text(font, line.prefixText(), x + 6, lineY, line.prefixColor());
+			graphics.text(font, line.suffixText(), x + 6 + prefixWidth, lineY, line.suffixColor());
 			lineY += font.lineHeight + 2;
 		}
 	}
@@ -501,6 +760,19 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 	public void setBoldText(boolean value) { boldText = value; }
 	public boolean isItalicText() { return italicText; }
 	public void setItalicText(boolean value) { italicText = value; }
+	public boolean isStormPadTickTimerEnabled() { return stormPadTickTimerEnabled; }
+	public void setStormPadTickTimerEnabled(boolean value) { stormPadTickTimerEnabled = value; }
+	public boolean isTerracottaRespawnTimersEnabled() { return terracottaRespawnTimersEnabled; }
+	public void setTerracottaRespawnTimersEnabled(boolean value) {
+		terracottaRespawnTimersEnabled = value;
+		if (!value) terracottaTimers.clear();
+	}
+	public boolean isTerracottaSpawnTimerEnabled() { return terracottaSpawnTimerEnabled; }
+	public boolean isLastBreathTimerEnabled() { return lastBreathTimerEnabled; }
+	public void setLastBreathTimerEnabled(boolean value) { lastBreathTimerEnabled = value; }
+	public int getLastBreathBoxColor() { return lastBreathBoxColor; }
+	public void setLastBreathBoxColor(int value) { lastBreathBoxColor = value | 0xFF000000; }
+	public void setTerracottaSpawnTimerEnabled(boolean value) { terracottaSpawnTimerEnabled = value; }
 
 	@Override
 	public JsonElement savePersistedData() {
@@ -515,6 +787,11 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 		obj.addProperty("boldText", boldText);
 		obj.addProperty("italicText", italicText);
 		obj.addProperty("stormLightningSyncEnabled", stormLightningSyncEnabled);
+		obj.addProperty("stormPadTickTimerEnabled", stormPadTickTimerEnabled);
+		obj.addProperty("terracottaRespawnTimersEnabled", terracottaRespawnTimersEnabled);
+		obj.addProperty("terracottaSpawnTimerEnabled", terracottaSpawnTimerEnabled);
+		obj.addProperty("lastBreathTimerEnabled", lastBreathTimerEnabled);
+		obj.addProperty("lastBreathBoxColor", lastBreathBoxColor);
 		obj.addProperty("anchorX", position.anchorX);
 		obj.addProperty("anchorY", position.anchorY);
 		obj.addProperty("scale", position.scale);
@@ -537,6 +814,13 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 		if (obj.has("boldText")) boldText = obj.get("boldText").getAsBoolean();
 		if (obj.has("italicText")) italicText = obj.get("italicText").getAsBoolean();
 		if (obj.has("stormLightningSyncEnabled")) stormLightningSyncEnabled = obj.get("stormLightningSyncEnabled").getAsBoolean();
+		if (obj.has("stormPadTickTimerEnabled")) stormPadTickTimerEnabled = obj.get("stormPadTickTimerEnabled").getAsBoolean();
+		if (obj.has("terracottaRespawnTimersEnabled")) terracottaRespawnTimersEnabled = obj.get("terracottaRespawnTimersEnabled").getAsBoolean();
+		if (obj.has("terracottaSpawnTimerEnabled")) terracottaSpawnTimerEnabled = obj.get("terracottaSpawnTimerEnabled").getAsBoolean();
+		if (obj.has("lastBreathTimerEnabled")) lastBreathTimerEnabled = obj.get("lastBreathTimerEnabled").getAsBoolean();
+		if (obj.has("lastBreathBoxColor")) lastBreathBoxColor = obj.get("lastBreathBoxColor").getAsInt();
+		// Older configs' "stormPadTickColorCodeNumber"/"stormPadTickBoldText"/"stormPadTickItalicText"/
+		// "stormPadTickTextColor" keys are silently ignored — those settings were removed per user request.
 		if (obj.has("anchorX") && obj.has("anchorY")) {
 			float s = obj.has("scale") ? obj.get("scale").getAsFloat() : position.scale;
 			position.set(obj.get("anchorX").getAsFloat(), obj.get("anchorY").getAsFloat(), s);
@@ -545,6 +829,6 @@ public class DungeonTimersFeature extends Feature implements MoveableWidget {
 
 	@Override
 	public String getDescription() {
-		return "F7 boss-fight timer panel: Storm's crystal/lightning timers, the purple pad timer, and other countdown readouts.";
+		return "Boss-fight timer panel: F7 Storm/Goldor/Maxor/Necron countdowns and F6 Terracotta spawn/respawn timers.";
 	}
 }

@@ -64,6 +64,10 @@ public class NeuStyleButtonsFeature extends Feature {
 
 	// Inline setup-form state for whichever slot is currently being edited, or -1 if none.
 	private int editingSlot = -1;
+	private static NeuStyleButtonsFeature instance;
+
+	/** True while a button's setup form is open — other inventory overlays yield clicks to it. */
+	public static boolean isEditingForm() { return instance != null && instance.isEnabled() && instance.editingSlot >= 0; }
 	private String formCommand = "";
 	private String formItemQuery = "";
 	private String formCount = "1";
@@ -84,6 +88,7 @@ public class NeuStyleButtonsFeature extends Feature {
 
 	public NeuStyleButtonsFeature() {
 		super("neu_style_buttons", "Inventory Buttons", FeatureCategory.INVENTORY, false);
+		instance = this;
 		for (int i = 0; i < SLOT_COUNT; i++) buttons.add(new ButtonConfig());
 
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
@@ -91,6 +96,14 @@ public class NeuStyleButtonsFeature extends Feature {
 			// NPC shops, enchanting table, etc. all extend it too, which is why the ring used to show up
 			// around every GUI the player opened).
 			if (!(screen instanceof net.minecraft.client.gui.screens.inventory.InventoryScreen containerScreen)) return;
+			ScreenEvents.afterExtract(screen).register((s, graphics, mouseX, mouseY, delta) -> {
+				if (!isEnabled() || editingSlot < 0) return;
+				try {
+					renderForm(graphics, Minecraft.getInstance().font);
+				} catch (Exception e) {
+					SkyblockSimplified.LOGGER.error("Quick Action Buttons form render failed, skipping this frame", e);
+				}
+			});
 			ScreenMouseEvents.allowMouseClick(screen).register((s, event) -> {
 				if (!isEnabled()) return true;
 				return handleClick(event.x(), event.y(), event.button());
@@ -261,7 +274,8 @@ public class NeuStyleButtonsFeature extends Feature {
 			}
 		}
 
-		if (editingSlot >= 0) renderForm(graphics, font);
+		// The setup form is drawn in its own afterExtract pass (see the constructor) so it sits above every
+		// other inventory overlay — Equipment Display used to paint over it.
 	}
 
 	private void renderForm(GuiGraphicsExtractor graphics, Font font) {

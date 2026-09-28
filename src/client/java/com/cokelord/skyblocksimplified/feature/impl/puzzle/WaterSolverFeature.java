@@ -93,6 +93,7 @@ public class WaterSolverFeature extends Feature {
 	// wool positions and silently give up forever, since nothing ever re-triggered it. Retried for a few
 	// seconds after entry instead of only once.
 	private DungeonRoom pendingScanRoom;
+	private int lastRunId = Integer.MIN_VALUE;
 
 	@Override
 	protected void onEnable() {
@@ -108,7 +109,6 @@ public class WaterSolverFeature extends Feature {
 			});
 			DungeonBlockDetector.addListener((pos, type) -> {
 				if (instance == null || !instance.isEnabled() || type != DungeonBlockDetector.ClickedBlockType.LEVER) return;
-				instance.onLeverClicked(pos);
 				// Real bug found (per user report — "The waterboard solver also sometimes doesn't work
 				// either. No half working either just fully doesn't work sometimes"): the original scan only
 				// ever retried for a fixed ~5s window after room entry, on the assumption the identifying
@@ -119,6 +119,9 @@ public class WaterSolverFeature extends Feature {
 				// permanently disabling the solver for that room. Also retries on every real lever click,
 				// tying the retry to actual puzzle progress instead of a blind clock.
 				if (instance.patternIdentifier == -1) instance.scan(WorldScan.getCurrentRoom());
+				// Counted AFTER the scan: counting first dropped the very click that triggered the scan, so the
+				// solver thought the water lever was never flicked.
+				instance.onLeverClicked(pos);
 			});
 			ClientTickEvents.END_CLIENT_TICK.register(client -> {
 				if (instance == null || !instance.isEnabled()) return;
@@ -128,8 +131,19 @@ public class WaterSolverFeature extends Feature {
 				// in an unidentified Water Board room, matching this codebase's own established "self-heal
 				// against an unknown-duration race" convention (e.g. PartyApi's own leader-resolution retry)
 				// instead of a one-shot timer that can simply run out before the real condition is ever true.
-				if (instance.patternIdentifier == -1 && instance.pendingScanRoom != null) {
-					instance.scan(instance.pendingScanRoom);
+				// A new run (or leaving the dungeon) starts fresh — the old pattern/click counts used to carry over.
+				int runId = com.cokelord.skyblocksimplified.dungeon.DungeonState.getRunId();
+				if (runId != instance.lastRunId || !com.cokelord.skyblocksimplified.dungeon.DungeonState.isInDungeon()) {
+					if (instance.patternIdentifier != -1 || instance.openedWaterTicks != -1) instance.reset();
+					instance.lastRunId = runId;
+				}
+				// Per user report ("doesnt render at times. It only starts rendering when i flick the water
+				// lever"): the room is often only identified as Water Board a moment AFTER you walk in, so the
+				// enter-time scan missed it (pendingScanRoom never set) and nothing rescanned until a lever
+				// click. Keep retrying on the current room while unsolved.
+				if (instance.patternIdentifier == -1 && instance.tickCounter % 5 == 0) {
+					DungeonRoom current = WorldScan.getCurrentRoom();
+					instance.scan(current != null ? current : instance.pendingScanRoom);
 				}
 			});
 			HudElementRegistry.attachElementBefore(net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements.PLAYER_LIST, Identifier.fromNamespaceAndPath("skyblocksimplified", "puzzle_water_board"), WaterSolverFeature::renderStatic);

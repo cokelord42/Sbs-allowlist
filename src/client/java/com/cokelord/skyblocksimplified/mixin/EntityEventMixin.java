@@ -17,9 +17,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class EntityEventMixin {
 	@Inject(method = "handleEntityEvent", at = @At("HEAD"))
 	private void skyblocksimplified$onEntityEvent(ClientboundEntityEventPacket packet, CallbackInfo ci) {
+		// Vanilla runs this handler twice (network thread, then re-queued on the main thread); only the
+		// main-thread pass is real.
+		if (!net.minecraft.client.Minecraft.getInstance().isSameThread()) return;
 		Level level = Minecraft.getInstance().level;
 		if (level == null) return;
 		Entity entity = packet.getEntity(level);
-		if (entity != null) MimicFeature.onEntityEvent(entity, packet.getEventId());
+		if (entity != null) {
+			MimicFeature.onEntityEvent(entity, packet.getEventId());
+			com.cokelord.skyblocksimplified.dungeon.DungeonBlockDetector.onEntityEvent(entity, packet.getEventId());
+		}
 	}
 }

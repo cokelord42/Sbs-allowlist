@@ -25,6 +25,10 @@ public class ItemPickupPacketMixin {
 	@Inject(method = "handleTakeItemEntity", at = @At("HEAD"))
 	private void skyblocksimplified$onTakeItemEntity(ClientboundTakeItemEntityPacket packet, CallbackInfo ci) {
 		Minecraft mc = Minecraft.getInstance();
+		// Vanilla first calls this on the network thread, which re-queues it to the main thread and calls it
+		// again — HEAD fired for both, so one pickup counted twice (a Dungeon Routes pickup step followed by
+		// another pickup step got skipped). Only the main-thread call is real.
+		if (!mc.isSameThread()) return;
 		Level level = mc.level;
 		if (level == null || mc.player == null) return;
 		Entity from = level.getEntity(packet.getItemId());

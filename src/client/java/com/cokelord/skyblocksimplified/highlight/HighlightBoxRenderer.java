@@ -215,7 +215,7 @@ public final class HighlightBoxRenderer {
 	 *  in {@link #renderInner} for when this is used. */
 	private static void drawSimpleBox(GuiGraphicsExtractor graphics, Entity entity, int color, float partialTick) {
 		net.minecraft.world.phys.Vec3 interpolated = entity.getPosition(partialTick).subtract(entity.position());
-		AABB box = inflateToMinimumSize(entity.getBoundingBox(), null);
+		AABB box = inflateToMinimumSize(unionWithMountedEntities(entity), null);
 		box = box.move(interpolated.x, interpolated.y + Y_OFFSET, interpolated.z);
 		WorldToScreen.ScreenPoint center = WorldToScreen.project(box.getCenter());
 		if (center.behindCamera()) return;
@@ -285,8 +285,23 @@ public final class HighlightBoxRenderer {
 		// entity renderer applies — see render()'s own doc comment for why this is what actually fixes the
 		// "boxes look laggy/snap around" report, not the polling-rate toggle.
 		net.minecraft.world.phys.Vec3 interpolated = entity.getPosition(partialTick).subtract(entity.position());
-		AABB box = inflateToMinimumSize(entity.getBoundingBox(), RULE_MIN_SIZE_OVERRIDE.get(ruleId));
+		AABB box = inflateToMinimumSize(unionWithMountedEntities(entity), RULE_MIN_SIZE_OVERRIDE.get(ruleId));
 		return box.move(interpolated.x, interpolated.y + yOffset, interpolated.z);
+	}
+
+	/** Per user request ("Make it highlight both as one big box instead"): unions the entity's own bounding
+	 *  box with its vehicle's and every passenger's — for the "small named rider stacked on a bigger,
+	 *  nameless mount" boss shape (Tarantula Broodfather etc — see {@code MobHighlightFeature#matches}'s own
+	 *  doc comment), a box built from just ONE half of that stack can never actually cover the real visible
+	 *  model regardless of which half a given rule happens to match. A no-op for the overwhelming majority
+	 *  of highlighted entities, which have no vehicle or passengers at all. */
+	private static AABB unionWithMountedEntities(Entity entity) {
+		AABB box = entity.getBoundingBox();
+		if (entity.getVehicle() != null) box = box.minmax(entity.getVehicle().getBoundingBox());
+		for (Entity passenger : entity.getPassengers()) {
+			box = box.minmax(passenger.getBoundingBox());
+		}
+		return box;
 	}
 
 	private static void drawBox(GuiGraphicsExtractor graphics, Entity entity, MobHighlightFeature feature, int color, boolean full, String ruleId, float partialTick) {

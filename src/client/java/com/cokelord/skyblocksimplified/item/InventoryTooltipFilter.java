@@ -27,6 +27,7 @@ public final class InventoryTooltipFilter {
 		registered = true;
 		ItemTooltipCallback.EVENT.register((stack, context, flag, lines) -> {
 			if (isOn("show_item_quality")) addItemQualityLore(stack, lines);
+			if (!lines.isEmpty()) lines.set(0, MasterStarRevert.revertIfEnabled(lines.get(0)));
 		});
 	}
 

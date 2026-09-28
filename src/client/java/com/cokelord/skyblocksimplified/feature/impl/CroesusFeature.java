@@ -218,6 +218,21 @@ public class CroesusFeature extends Feature {
 		return CROESUS_LIST_TITLE.matcher(title).matches();
 	}
 
+	/** Claimed per Hypixel's own lore only — unlike {@link #isOpenedChest}, a chest you just ROLLED (viewed
+	 *  its rewards) still counts as claimable. Per user report ("If theres a drop in the bedrock chest it
+	 *  doesnt count towards the highlight most profitable chest... it says the best chest is the wooden
+	 *  chest"): ranking used isOpenedChest, so the just-rolled Bedrock chest holding the Recombobulator was
+	 *  dropped from the ranking entirely. */
+	private boolean isClaimedChest(ItemStack stack) {
+		ItemLore lore = stack.get(DataComponents.LORE);
+		if (lore == null) return false;
+		for (var line : lore.lines()) {
+			String text = line.getString();
+			if (text.contains(OPENED_CHEST_PHRASE) || text.contains(OPENED_RUN_PHRASE)) return true;
+		}
+		return false;
+	}
+
 	private boolean isOpenedChest(ItemStack stack) {
 		ItemLore lore = stack.get(DataComponents.LORE);
 		if (lore != null) {
@@ -363,7 +378,7 @@ public class CroesusFeature extends Feature {
 			if (typeName == null) continue;
 			chestSlots.add(slot);
 			if ("Wood".equals(typeName)) woodSlot = slot;
-			if (isOpenedChest(stack)) continue;
+			if (isClaimedChest(stack)) continue;
 
 			unopened.add(new Scored(slot, computeChestProfit(stack, slot.index)));
 		}
@@ -402,7 +417,7 @@ public class CroesusFeature extends Feature {
 		if (ChestRollingFeature.isModuleEnabled() && !requiredChestsRolled(ranked.chestSlots())) return;
 
 		for (Slot slot : ranked.chestSlots()) {
-			if (isOpenedChest(slot.getItem())) continue;
+			if (isClaimedChest(slot.getItem())) continue;
 			if (slot != ranked.best() && slot != ranked.second()) continue;
 
 			// Per user request: an actual translucent box overlay ON the slot (~30% opacity), not an

@@ -85,7 +85,7 @@ public class DungeonRoutesFeature extends Feature {
 	// SECRET_LEVER being the one real "click something along the way" type.
 	private static final StepType[] SELECTABLE_TYPES = {
 		StepType.BREAKABLE_BLOCKS, StepType.WAYPOINT, StepType.SECRET_PICKUP, StepType.SECRET_CHEST,
-		StepType.SECRET_BAT, StepType.SECRET_ESSENCE, StepType.SECRET_LEVER, StepType.ENDERPEARL_WAYPOINT,
+		StepType.SECRET_BAT, StepType.SECRET_ESSENCE, StepType.SECRET_LEVER,
 		StepType.ENDERWARP_WAYPOINT, StepType.SUPERBOOM_BLOCK
 	};
 
@@ -522,6 +522,9 @@ public class DungeonRoutesFeature extends Feature {
 		if (instance != null) instance.onBlockEvent(pos, DungeonBlockDetector.ClickedBlockType.TRAPPED_CHEST);
 	}
 
+	// Essence steps advance on DungeonBlockDetector's WITHER_ESSENCE_PICKUP, which already merges the head
+	// click, secret-count confirmation and the "You found a Wither Essence!" chat line into one event.
+
 	private void onBlockEvent(BlockPos pos, DungeonBlockDetector.ClickedBlockType type) {
 		if (!isEnabled() || activeRoomName == null) return;
 		List<RouteItem> myItems = activeItems();
@@ -543,6 +546,8 @@ public class DungeonRoutesFeature extends Feature {
 				case SECRET_CHEST -> (type == DungeonBlockDetector.ClickedBlockType.CHEST || type == DungeonBlockDetector.ClickedBlockType.TRAPPED_CHEST)
 					&& pos != null && room != null && Vec3.atCenterOf(pos).distanceTo(realPositionOf(room, item)) <= SECRET_CLICK_MAX_DISTANCE;
 				case SECRET_BAT -> type == DungeonBlockDetector.ClickedBlockType.SECRET_BAT_DEATH;
+				// Per user request ("All step types containing secrets need to be INSTANT"): the head click is
+				// instant; the detector merges it with the secret-count / chat confirmations into one event.
 				case SECRET_ESSENCE -> type == DungeonBlockDetector.ClickedBlockType.WITHER_ESSENCE_PICKUP;
 				case SECRET_LEVER -> type == DungeonBlockDetector.ClickedBlockType.LEVER
 					&& pos != null && room != null && Vec3.atCenterOf(pos).distanceTo(realPositionOf(room, item)) <= SECRET_CLICK_MAX_DISTANCE;
@@ -558,11 +563,24 @@ public class DungeonRoutesFeature extends Feature {
 				if (item.type == StepType.SECRET_CHEST && pos != null && room != null) {
 					recordAlignmentCorrection(room, item, pos);
 				}
+				// Per user report (two Wither Essences side by side, grabbed back to back): a step holding
+				// several essence items only advances once that many essences were picked up, so the first
+				// pickup doesn't hide the second essence.
+				if (item.type == StepType.SECRET_ESSENCE) {
+					long needed = myItems.stream().filter(i -> i.stepNumber == step && i.type == StepType.SECRET_ESSENCE).count();
+					String key = activeRoomName + "#" + step;
+					if (!key.equals(essenceStepKey)) { essenceStepKey = key; essencesThisStep = 0; }
+					if (++essencesThisStep < needed) break;
+					essenceStepKey = null;
+				}
 				if (item.advancesStep) advanceStep(activeRoomName, myItems);
 				break;
 			}
 		}
 	}
+
+	private String essenceStepKey = null;
+	private int essencesThisStep = 0;
 
 	/** See roomAlignmentOffsets' own field doc comment for why this exists at all. */
 	private static void recordAlignmentCorrection(DungeonRoom room, RouteItem item, BlockPos actualChestPos) {
@@ -1376,6 +1394,7 @@ public class DungeonRoutesFeature extends Feature {
 			}
 			items.removeIf(item -> item.roomName.equals(roomName));
 			items.addAll(imported);
+			purgePearlSteps();
 			com.cokelord.skyblocksimplified.config.ConfigManager.save();
 			return true;
 		} catch (Exception e) {
@@ -1393,6 +1412,7 @@ public class DungeonRoutesFeature extends Feature {
 			items.removeIf(i -> i.roomName.equals(entry.getKey()));
 			items.addAll(entry.getValue());
 		}
+		purgePearlSteps();
 		com.cokelord.skyblocksimplified.config.ConfigManager.save();
 	}
 
@@ -1425,6 +1445,15 @@ public class DungeonRoutesFeature extends Feature {
 		// left permanent stepNumber gaps baked into this exact saved config, which would keep skipping steps
 		// forever even after removeItem itself got fixed — this self-heals any already-corrupted route the
 		// instant it loads, not just ones edited from now on.
+		purgePearlSteps();
+	}
+
+	/** Per user request ("Delete the ender pearl steps from the dungeon routes"): every Enderpearl step is
+	 *  removed on load and after any import, and the room's remaining steps close up the gap (a step that
+	 *  held only the pearl disappears and everything after it moves back one; a pearl sharing its step with
+	 *  other items just leaves those). The enum value stays so old configs still parse. */
+	private void purgePearlSteps() {
+		items.removeIf(item -> item.type == StepType.ENDERPEARL_WAYPOINT);
 		closeAllStepNumberGaps();
 	}
 

@@ -49,6 +49,23 @@ public final class DungeonBlockDetector {
 	private static final List<BiConsumer<BlockPos, ClickedBlockType>> LISTENERS = new ArrayList<>();
 	private static boolean registered = false;
 
+	// Real bug found (per user report — "dungeon routes doesnt detect a wither essence click. It needs to
+	// detect me right clicking a player head and the secret count increasing shortly after"): classify()'s
+	// exact-texture match below is a fast, precise path, but it silently drops every click on a Wither
+	// Essence head whose texture doesn't byte-for-byte match WITHER_ESSENCE_TEXTURE — and there's no live
+	// confirmation that's the only texture Hypixel has ever used for this head (SkyHanni-REPO data can go
+	// stale same as any other bundled skin hash). Rather than trust one fixed texture as the only signal,
+	// any right-click on an UNRECOGNIZED player head while in a dungeon is tracked here and confirmed
+	// retroactively the same way the user described: if the real tab-list secret counter
+	// ({@link DungeonState#getSecretsFound()}) actually goes up within a couple seconds of that click, the
+	// click + secret-gained combination is treated as a genuine Wither Essence pickup regardless of the
+	// head's exact texture — a decorative head that isn't a real secret never sees its own click followed by
+	// a secret count increase, so this can't misfire on ordinary dungeon decoration.
+	private static final long WITHER_ESSENCE_CONFIRM_WINDOW_MILLIS = 5000L;
+	private record PendingHeadClick(BlockPos pos, long clickedAtMillis, int secretsAtClick) {}
+	private static final List<PendingHeadClick> pendingHeadClicks = new ArrayList<>();
+	private static int secretsConsumedByPending = 0;
+
 	private DungeonBlockDetector() {}
 
 	public static synchronized void addListener(BiConsumer<BlockPos, ClickedBlockType> listener) {
@@ -63,19 +80,44 @@ public final class DungeonBlockDetector {
 			if (!com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) return InteractionResult.PASS;
 			BlockPos pos = hitResult.getBlockPos();
 			ClickedBlockType type = classify(level, pos);
-			if (type != null) {
+			if (type == ClickedBlockType.WITHER_ESSENCE_PICKUP) {
+				fireEssence(pos, false);
+			} else if (type != null) {
 				fire(pos, type);
+			} else if (isUnrecognizedPlayerHead(level, pos)) {
+				pendingHeadClicks.add(new PendingHeadClick(pos, System.currentTimeMillis(), DungeonState.getSecretsFound()));
 			}
 			return InteractionResult.PASS;
 		});
 		// Wrapped in try-catch — see BlessingParticleFilter's doc comment on its own registration for why:
 		// this registers before FeatureRegistry::tickAll (during feature construction), and an uncaught
 		// throw here would silently skip tickAll (and every feature it ticks) for that whole frame.
+		// ALLOW_GAME (always returning true), not GAME: Chat De-clutter's "Hide Wither Essence Messages" cancels
+		// the line, and cancelled lines never reach GAME listeners — essence detection must still see it.
+		net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+			if (overlay || LISTENERS.isEmpty()) return true;
+			try {
+				onChat(message.getString().replaceAll("§.", "").strip());
+			} catch (Exception e) {
+				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("DungeonBlockDetector chat hook threw", e);
+			}
+			return true;
+		});
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			try {
 				tickSecretBats(client);
 			} catch (Exception e) {
 				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("DungeonBlockDetector secret-bat tick threw, skipping this tick", e);
+			}
+			try {
+				tickTouchedItems(client);
+			} catch (Exception e) {
+				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("DungeonBlockDetector item-touch tick threw, skipping this tick", e);
+			}
+			try {
+				tickPendingHeadClicks();
+			} catch (Exception e) {
+				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("DungeonBlockDetector pending-head-click tick threw, skipping this tick", e);
 			}
 		});
 		// Real bug found (per user report — "Secret pickup gets detected when picking up items from chests" —
@@ -115,6 +157,43 @@ public final class DungeonBlockDetector {
 		return null;
 	}
 
+	/** See {@link #pendingHeadClicks}'s own doc comment — any player-head block classify() didn't already
+	 *  recognize (a decorative head, or a real Wither Essence head using a texture this class doesn't have
+	 *  on file) is a candidate for the click+secret-count-increase fallback below. */
+	private static boolean isUnrecognizedPlayerHead(net.minecraft.world.level.Level level, BlockPos pos) {
+		var block = level.getBlockState(pos).getBlock();
+		return block == Blocks.PLAYER_HEAD || block == Blocks.PLAYER_WALL_HEAD;
+	}
+
+	/** Confirms or discards every click tracked by {@link #isUnrecognizedPlayerHead}: fires a (delayed, but
+	 *  still real) {@link ClickedBlockType#WITHER_ESSENCE_PICKUP} the moment the tab-list secret counter
+	 *  actually rises above what it was at click time, or silently drops the click once
+	 *  {@link #WITHER_ESSENCE_CONFIRM_WINDOW_MILLIS} passes with no such increase (an ordinary decorative
+	 *  head, or a secret that came from something else entirely in that window). */
+	private static void tickPendingHeadClicks() {
+		if (pendingHeadClicks.isEmpty()) return;
+		if (!com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) {
+			pendingHeadClicks.clear();
+			return;
+		}
+		long now = System.currentTimeMillis();
+		int currentSecrets = DungeonState.getSecretsFound();
+		// One confirmation per secret actually gained (oldest click first): two quick essence clicks made
+		// before the counter moved share the same baseline, and a single +1 must not confirm both.
+		java.util.Iterator<PendingHeadClick> it = pendingHeadClicks.iterator();
+		while (it.hasNext()) {
+			PendingHeadClick click = it.next();
+			if (currentSecrets > click.secretsAtClick() + secretsConsumedByPending) {
+				secretsConsumedByPending++;
+				it.remove();
+				fireEssence(click.pos(), false);
+			} else if (now - click.clickedAtMillis() > WITHER_ESSENCE_CONFIRM_WINDOW_MILLIS) {
+				it.remove();
+			}
+		}
+		if (pendingHeadClicks.isEmpty()) secretsConsumedByPending = 0;
+	}
+
 	// Real, confirmed fixed dungeon item-secret list — Skyblock item ids ported from Devonian's own
 	// DungeonEvent.SecretPickup.SECRET_ITEMS, trimmed to exactly the items the user asked to detect. "POTION"
 	// is handled separately below (Healing-only, per Devonian's own special case for it) since the user
@@ -132,13 +211,47 @@ public final class DungeonBlockDetector {
 	public static void onLocalPlayerItemPickup(ItemEntity item) {
 		if (LISTENERS.isEmpty() || !com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) return;
 		if (System.currentTimeMillis() - lastContainerCloseMillis < CONTAINER_CLOSE_SUPPRESS_MILLIS) return;
+		// Already fired the instant the player touched it (tickTouchedItems) — the server's pickup packet
+		// arriving afterwards is the same pickup.
+		if (!firedItemIds.add(item.getId())) return;
+		classifyAndFirePickup(item);
+	}
+
+	// Per user request ("All step types containing secrets need to be INSTANT"): the server's pickup packet
+	// only arrives after its own pickup check, a noticeable delay. The player's vanilla pickup reach (their
+	// box grown 1 block sideways, 0.5 up/down) touching a ground item is when the pickup actually happens, so
+	// fire then. Items younger than 10 ticks are skipped (a just-dropped item can't be picked up yet), and
+	// each item entity fires once (firedItemIds, shared with the packet path).
+	private static final java.util.Set<Integer> firedItemIds = new java.util.HashSet<>();
+
+	private static void tickTouchedItems(net.minecraft.client.Minecraft client) {
+		if (client.player == null || client.level == null || LISTENERS.isEmpty()) return;
+		if (!com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) {
+			firedItemIds.clear();
+			firedBatIds.clear();
+			firedEssencePositions.clear();
+			chatSwallows.clear();
+			clickSwallows.clear();
+			return;
+		}
+		if (client.player.isSpectator() || !client.player.isAlive()) return;
+		AABB reach = client.player.getBoundingBox().inflate(1.0, 0.5, 1.0);
+		for (ItemEntity item : client.level.getEntitiesOfClass(ItemEntity.class, reach)) {
+			if (item.tickCount < 10 || item.getItem().isEmpty() || firedItemIds.contains(item.getId())) continue;
+			firedItemIds.add(item.getId());
+			classifyAndFirePickup(item);
+		}
+		if (firedItemIds.size() > 512) firedItemIds.clear();
+	}
+
+	private static void classifyAndFirePickup(ItemEntity item) {
 		var stack = item.getItem();
 		String skyblockId = com.cokelord.skyblocksimplified.util.SkyblockNbtUtils.getItemId(stack);
 		String texture = SkullTextureUtil.fromItem(stack);
 		String plainName = stack.getHoverName().getString().replaceAll("§.", "");
 		boolean isWitherEssence = WITHER_ESSENCE_TEXTURE.equals(texture) || plainName.contains("Wither Essence");
 		if (isWitherEssence) {
-			fire(item.blockPosition(), ClickedBlockType.WITHER_ESSENCE_PICKUP);
+			fireEssence(item.blockPosition(), false);
 			return;
 		}
 		boolean isHealingPotion = "POTION".equals(skyblockId) && isHealingSplashPotion(stack);
@@ -192,11 +305,18 @@ public final class DungeonBlockDetector {
 		java.util.Map<Integer, net.minecraft.world.entity.Entity> nowNearby = new java.util.HashMap<>();
 		for (var entity : client.level.getEntitiesOfClass(net.minecraft.world.entity.ambient.Bat.class, area)) {
 			if (entity.getMaxHealth() != VANILLA_BAT_MAX_HEALTH) {
+				// Per user request ("bat also cause that one takes forever"): the bat only despawns after its
+				// ~1s death animation — fire the moment it's dead (health 0) instead.
+				if (entity.isDeadOrDying()) {
+					if (firedBatIds.add(entity.getId())) fire(entity.blockPosition(), ClickedBlockType.SECRET_BAT_DEATH);
+					continue;
+				}
 				nowNearby.put(entity.getId(), entity);
 			}
 		}
 		for (var entry : lastNearbySecretBats.entrySet()) {
 			if (nowNearby.containsKey(entry.getKey())) continue;
+			if (!firedBatIds.add(entry.getKey())) continue;
 			// Being tracked one tick and gone from this same 24-block scan the next is already the exact
 			// despawn signal SkyHanni's own onMobDeSpawn listener fires the chime on — this used to also
 			// require bat.isRemoved()/!isAlive() on the stale cached Entity reference, but a client-side
@@ -206,6 +326,67 @@ public final class DungeonBlockDetector {
 			fire(entry.getValue().blockPosition(), ClickedBlockType.SECRET_BAT_DEATH);
 		}
 		lastNearbySecretBats = nowNearby;
+	}
+
+	private static final java.util.Set<Integer> firedBatIds = new java.util.HashSet<>();
+
+	// ---- Wither Essence: one signal per real essence, from whichever source is first ----
+	// Per user report ("If the server lags after a wither essence is picked up and the chat message doesnt
+	// fire it bugs out. Make it search for one for atleast 3 seconds"): an essence can be seen as a head
+	// click (instant when the texture is known), an unrecognized-head click confirmed by the secret count or
+	// the chat line within WITHER_ESSENCE_CONFIRM_WINDOW_MILLIS, or only the chat line (click missed). Every
+	// source funnels through fireEssence so Dungeon Routes and Clicked Blocks get exactly one event:
+	// - a head position fires at most once per run;
+	// - after a click fires, the next own chat line within 10s is that same essence and is swallowed;
+	// - after a chat-only fire, a click within 3s is that same essence and is swallowed.
+	private static final String OWN_ESSENCE_LINE = "You found a Wither Essence!";
+	private static final java.util.Set<BlockPos> firedEssencePositions = new java.util.HashSet<>();
+	// Per user report ("rooms that have two wither essences next to each other and you can pick these up
+	// really fast"): swallows are COUNTED, one per essence, so two quick pickups (two clicks, then two chat
+	// lines) stay two events instead of the second chat line reading as a third essence. Each entry is its
+	// expiry time.
+	private static final java.util.ArrayDeque<Long> chatSwallows = new java.util.ArrayDeque<>();
+	private static final java.util.ArrayDeque<Long> clickSwallows = new java.util.ArrayDeque<>();
+
+	private static boolean takeSwallow(java.util.ArrayDeque<Long> queue, long now) {
+		while (!queue.isEmpty() && queue.peekFirst() < now) queue.pollFirst();
+		return queue.pollFirst() != null;
+	}
+
+	private static void fireEssence(BlockPos pos, boolean fromChat) {
+		long now = System.currentTimeMillis();
+		if (fromChat) {
+			if (takeSwallow(chatSwallows, now)) return;
+			clickSwallows.addLast(now + 3000L);
+			fire(null, ClickedBlockType.WITHER_ESSENCE_PICKUP);
+			return;
+		}
+		if (pos != null && !firedEssencePositions.add(pos.immutable())) return;
+		if (takeSwallow(clickSwallows, now)) return;
+		chatSwallows.addLast(now + 10_000L);
+		fire(pos, ClickedBlockType.WITHER_ESSENCE_PICKUP);
+	}
+
+	/** Chat hook for the local player's own essence line (teammates' read "<name> found a Wither Essence!"). */
+	private static void onChat(String plain) {
+		if (!plain.contains(OWN_ESSENCE_LINE) || !com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) return;
+		// A click still waiting for confirmation IS this essence — confirm it (with its position) now.
+		if (!pendingHeadClicks.isEmpty()) {
+			// Oldest first: with two essences grabbed back to back, the first line belongs to the first click.
+			PendingHeadClick oldest = pendingHeadClicks.remove(0);
+			if (oldest.pos() == null || firedEssencePositions.add(oldest.pos().immutable())) {
+				fire(oldest.pos(), ClickedBlockType.WITHER_ESSENCE_PICKUP);
+			}
+			return;
+		}
+		fireEssence(null, true);
+	}
+
+	/** EntityEventMixin: the server's death event (id 3) for a secret bat — the earliest possible signal. */
+	public static void onEntityEvent(net.minecraft.world.entity.Entity entity, byte eventId) {
+		if (eventId != (byte) 3 || LISTENERS.isEmpty() || !(entity instanceof net.minecraft.world.entity.ambient.Bat bat)) return;
+		if (bat.getMaxHealth() == VANILLA_BAT_MAX_HEALTH || !com.cokelord.skyblocksimplified.util.IslandGate.isInDungeon()) return;
+		if (firedBatIds.add(bat.getId())) fire(bat.blockPosition(), ClickedBlockType.SECRET_BAT_DEATH);
 	}
 
 	private static void fire(BlockPos pos, ClickedBlockType type) {

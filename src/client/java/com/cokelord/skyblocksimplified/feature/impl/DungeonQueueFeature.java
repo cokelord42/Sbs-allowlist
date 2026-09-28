@@ -32,7 +32,7 @@ public class DungeonQueueFeature extends Feature implements MoveableWidget {
 	private static final Pattern PARTY_LEFT_PATTERN = Pattern.compile(
 		"^(?:You have left the party\\.|You left the party\\.|You have been removed from the party by .+|" +
 		"You have been kicked from the party by .+|The party was disbanded because .+|" +
-		"You have been kicked from the party\\.)$");
+		"You have been kicked from the party\\.)$", Pattern.MULTILINE);
 	// Real bug found (per user report — "Auto requeue does not stop when someone leaves the party", real
 	// captured line: "[MVP+] TsuaH has left the party."): PARTY_LEFT_PATTERN above only ever covers the
 	// LOCAL player's own party ending (they left/got kicked/it disbanded) — it has no case at all for a
@@ -40,7 +40,12 @@ public class DungeonQueueFeature extends Feature implements MoveableWidget {
 	// party leave" needs to catch (requeuing into the same dungeon short a member is rarely what anyone
 	// wants). Same rank-tag-tolerant shape PartyApi's own confirmed OTHER_LEFT pattern already uses — ".+"
 	// greedily swallows any bracketed rank prefix, cleaned up the same way, so it matches with or without one.
-	private static final Pattern OTHER_MEMBER_LEFT_PATTERN = Pattern.compile("^.+ has left the party\\.$");
+	// Per user report ("Disable on leave/kick ... does not work", lines "[VIP] iamzo_ has been removed from the
+	// party." / "[MVP+] _140ms has left the party."): Hypixel wraps party notices in "-----" separator lines
+	// inside ONE multi-line message, so the old whole-message ^...$ matches() never matched. MULTILINE +
+	// find() matches the notice line itself; kicks ("has been removed from the party.") are covered too.
+	private static final Pattern OTHER_MEMBER_LEFT_PATTERN = Pattern.compile(
+		"^(?:\\[[^\\]]+] )?\\w{1,16} (?:has left the party|has been removed from the party)\\.$", Pattern.MULTILINE);
 
 	// Per user request ("Separate the dungeon queue timer and the rest of the dungeon queue features. The
 	// timer should be a toggle inside so you don't need to have the timer to use autorequeue for example"):
@@ -129,8 +134,13 @@ public class DungeonQueueFeature extends Feature implements MoveableWidget {
 			return;
 		}
 
-		if (disableOnPartyLeave && (PARTY_LEFT_PATTERN.matcher(text).matches() || OTHER_MEMBER_LEFT_PATTERN.matcher(text).matches())) {
+		if (disableOnPartyLeave && (PARTY_LEFT_PATTERN.matcher(text).find() || OTHER_MEMBER_LEFT_PATTERN.matcher(text).find())) {
 			disableRequeue = true;
+			// A requeue already counting down (leave after the run ended) is cancelled outright.
+			if (requeueAtMillis > 0) {
+				requeueAtMillis = -1;
+				disableRequeue = false;
+			}
 		}
 	}
 

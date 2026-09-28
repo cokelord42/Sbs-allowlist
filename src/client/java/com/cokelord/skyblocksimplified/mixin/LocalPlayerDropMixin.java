@@ -26,7 +26,8 @@ public class LocalPlayerDropMixin {
 		ItemStack held = self.getInventory().getSelectedItem();
 		// Per user request ("allow users to 'drop' their currently held item when ult is ready, but only in
 		// dungeons") — see SlotLockingFeature#isReadyToDropUltimate's own doc comment for the exact detection.
-		if (SlotLockingFeature.isLocked(held) && !SlotLockingFeature.isReadyToDropUltimate(held)) {
+		if (SlotLockingFeature.isLocked(held) && !SlotLockingFeature.isReadyToDropUltimate(held)
+			&& !SlotLockingFeature.consumeAbilityDrop()) {
 			cir.setReturnValue(false);
 		}
 	}

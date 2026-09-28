@@ -207,6 +207,8 @@ public class PanelThemeFeature extends Feature {
 		if (obj.has("mode")) {
 			try {
 				mode = Mode.valueOf(obj.get("mode").getAsString());
+				// Custom is disabled for now (per user) — a saved Custom setup falls back to Black.
+				if (mode == Mode.CUSTOM) mode = Mode.BLACK;
 			} catch (IllegalArgumentException ignored) {}
 		}
 		if (obj.has("customPin1Argb")) customPin1Argb = obj.get("customPin1Argb").getAsInt();

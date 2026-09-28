@@ -15,7 +15,7 @@ import java.util.concurrent.CompletableFuture;
 /** Shared async JSON-over-HTTP GET helper for the Hypixel API — one HttpClient reused across every
  *  fetch instead of one per call, and every failure (network error, non-200, bad body) surfaces as an
  *  exceptional CompletableFuture instead of throwing on some other thread unnoticed. */
-final class HttpJsonFetcher {
+public final class HttpJsonFetcher {
 	// java.net.http.HttpClient does NOT follow redirects unless told to (its documented default policy
 	// is NEVER) — the real bug behind UpdateApi's jar download silently failing: latest.json's
 	// downloadUrl points at a GitHub Releases asset (github.com/.../releases/download/...), which always
@@ -42,27 +42,41 @@ final class HttpJsonFetcher {
 
 	private HttpJsonFetcher() {}
 
-	static CompletableFuture<JsonObject> fetchAsync(String url) {
+	public static CompletableFuture<JsonObject> fetchAsync(String url) {
 		HttpRequest request = HttpRequest.newBuilder(URI.create(url))
 			.timeout(Duration.ofSeconds(15))
 			.header("User-Agent", USER_AGENT)
+			.header("Accept-Encoding", "gzip")
 			.GET()
 			.build();
-		return CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+		return CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
 			.thenApply(response -> {
+				String body = decodeBody(response);
 				if (response.statusCode() != 200) {
 					// Real bug found (per user report — Party Finder's hover-for-stats silently never
-					// attaching): a non-200 response body from a JSON API almost always carries the real
-					// reason (e.g. a proxy's own "Invalid API key" error) — the exception message used to
-					// drop the body entirely, so every caller's own exceptionally() log line showed just a
-					// bare status code with no way to tell an auth/config problem apart from a network blip
-					// without re-running the request by hand outside the mod.
-					String body = response.body();
-					String snippet = body == null ? "" : body.substring(0, Math.min(200, body.length()));
+					// attaching): a non-200 body from a JSON API almost always carries the real reason (e.g.
+					// a proxy's own "Invalid API key" error), so it's kept in the exception message.
+					String snippet = body.substring(0, Math.min(200, body.length()));
 					throw new RuntimeException("HTTP " + response.statusCode() + " fetching " + url + ": " + snippet);
 				}
-				return JsonParser.parseString(response.body()).getAsJsonObject();
+				return JsonParser.parseString(body).getAsJsonObject();
 			});
+	}
+
+	/** Java's HttpClient never asks for or undoes compression on its own, so every JSON fetch used to download
+	 *  the full uncompressed body — ~2.4MB per player from the stats Worker. Requests now send
+	 *  {@code Accept-Encoding: gzip} and are inflated here when the server honored it (typically 5-8x smaller). */
+	private static String decodeBody(HttpResponse<byte[]> response) {
+		byte[] bytes = response.body();
+		boolean gzip = response.headers().firstValue("Content-Encoding").map(v -> v.equalsIgnoreCase("gzip")).orElse(false);
+		if (gzip) {
+			try (java.util.zip.GZIPInputStream in = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(bytes))) {
+				bytes = in.readAllBytes();
+			} catch (java.io.IOException e) {
+				throw new java.io.UncheckedIOException(e);
+			}
+		}
+		return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
 	}
 
 	/** Same as fetchAsync, but for endpoints needing request headers (e.g. an Authorization bearer
@@ -77,16 +91,17 @@ final class HttpJsonFetcher {
 		HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
 			.timeout(Duration.ofSeconds(15))
 			.header("User-Agent", USER_AGENT)
+			.header("Accept-Encoding", "gzip")
 			.GET();
 		for (Map.Entry<String, String> header : headers.entrySet()) {
 			builder.header(header.getKey(), header.getValue());
 		}
-		return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
+		return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
 			.thenApply(response -> {
 				if (response.statusCode() != 200) {
 					throw new RuntimeException("HTTP " + response.statusCode() + " fetching " + url);
 				}
-				return response.body();
+				return decodeBody(response);
 			});
 	}
 

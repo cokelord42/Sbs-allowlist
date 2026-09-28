@@ -62,6 +62,14 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 
 public class SkyblockSimplifiedClient implements ClientModInitializer {
+	/** Deferred a tick: the chat screen that ran the command closes right after it executes, which would
+	 *  immediately close a screen opened synchronously here (same reason OpenGuiFeature uses execute()). */
+	private static void openPlayerViewer(net.minecraft.client.Minecraft client, String name, String uuid) {
+		client.execute(() -> {
+			if (client.level != null) client.gui.setScreen(new com.cokelord.skyblocksimplified.pv.PlayerViewerScreen(name, uuid));
+		});
+	}
+
 	private static final String[] OPEN_GUI_COMMANDS = {"sbs", "sbsimplified", "skyblocksimplified"};
 
 	@Override
@@ -72,11 +80,13 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		FeatureRegistry.register(new GuiColorFeature());
 		FeatureRegistry.register(new PanelThemeFeature());
 		FeatureRegistry.register(new GuiAnimationsFeature());
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.RememberLastPageFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.ConfigExportImportFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.UiSoundEffectsFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.UpdateModuleFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.AutoUpdateOnCloseFeature());
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.ModInformationFeature());
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.NeuStyleButtonsFeature());
 		com.cokelord.skyblocksimplified.feature.impl.GyroHelperFeature gyroHelper = new com.cokelord.skyblocksimplified.feature.impl.GyroHelperFeature();
@@ -140,18 +150,28 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		com.cokelord.skyblocksimplified.item.EnchantTooltipFilter.register();
 		// Always-on infra: shared tooltip listener for Evolving Items / Personal Compactor / Estimated Item Value.
 		com.cokelord.skyblocksimplified.item.InventoryTooltipFilter.register();
+		// Always-on infra: Revert Master Stars also needs to catch chat/game messages like Hypixel's
+		// "X is holding [item]" broadcast, not just tooltips and the action-bar swap popup (the latter is
+		// handled directly inside VisualWordsSelectedItemNameMixin).
+		com.cokelord.skyblocksimplified.item.MasterStarRevert.registerChatHook();
 		// Always-on infra: captures the real per-frame view/projection matrices from the 3D world render
 		// pass, for HighlightBoxRenderer's screen-space projection (see WorldToScreen's doc comment).
 		com.cokelord.skyblocksimplified.highlight.WorldToScreen.register();
 		// Always-on infra: draws the screen-space box for any highlight feature set to a 2D render mode.
 		com.cokelord.skyblocksimplified.highlight.HighlightBoxRenderer.register();
-		// Always-on infra: the once-per-session bottom-right "update available" toast.
-		com.cokelord.skyblocksimplified.gui.UpdateToastRenderer.register();
+		// Always-on infra: the shared bottom-right notification toast (update-ready, config export/import,
+		// and anything else that reuses ModNotificationsFeature's queue).
+		com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.register();
 		// Always-on infra (Odin port): dungeon room/door detection from chunk scanning + the held map item,
 		// and floor/boss/teammate/secrets run-state — nearly every ported dungeon feature below reads from
 		// these. Order matters: WorldScan.register() internally drives DungeonState.tick()/MapScan.tick()
 		// each client tick, so DungeonState.register() (chat-based tracking) just needs to run once too.
 		com.cokelord.skyblocksimplified.dungeon.map.WorldScan.register();
+		// Always-on infra (Odin port, per user request — "Odin added websocket support for the dungeon map,
+		// rendering our rememberance system a little useless. Make it prioritize sending websocket data but
+		// if it cant find any it should fall back to our method"): must register after WorldScan since it
+		// attaches a WorldScan.addRoomEnterListener callback.
+		com.cokelord.skyblocksimplified.dungeon.map.DungeonMapSync.register();
 		com.cokelord.skyblocksimplified.dungeon.DungeonState.register();
 		com.cokelord.skyblocksimplified.dungeon.SelfClassCache.register();
 		// Always-on infra: "which floor/mode is the party currently queued for" — extracted out of
@@ -161,6 +181,7 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// elements (dungeon/garden/kuudra/crimson overlays) can't stay stuck showing after the player leaves.
 		com.cokelord.skyblocksimplified.util.IslandGate.register();
 		com.cokelord.skyblocksimplified.util.TpsMonitor.register();
+		com.cokelord.skyblocksimplified.util.ServerClock.register();
 		com.cokelord.skyblocksimplified.util.RealPingMonitor.register();
 		// Always-on infra: ticks the boss-proximity scan Hide Damage Splashes reads once per tick instead of
 		// once per splash entity per render frame (see BossProximityDetector's own doc comment).
@@ -211,6 +232,32 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 				dispatcher.register(builder);
 			}
 			SkyblockSimplified.LOGGER.info("Registered open-gui chat commands: {}", (Object) OPEN_GUI_COMMANDS);
+
+			// Per user request: "/pv" (or "/playerviewer") opens the Player Viewer on yourself, "/pv <name>" on
+			// anyone. Name suggestions come from the current tab list.
+			for (String name : new String[]{"pv", "playerviewer"}) {
+				dispatcher.register(ClientCommands.literal(name)
+					.executes(ctx -> {
+						net.minecraft.client.Minecraft client = ctx.getSource().getClient();
+						if (client.player != null) openPlayerViewer(client, client.player.getGameProfile().name(), client.player.getUUID().toString());
+						return 1;
+					})
+					.then(ClientCommands.argument("player", com.mojang.brigadier.arguments.StringArgumentType.word())
+						.suggests((ctx, builder) -> {
+							var connection = ctx.getSource().getClient().getConnection();
+							if (connection != null) {
+								for (var info : connection.getOnlinePlayers()) {
+									String n = info.getProfile().name();
+									if (n.matches("\\w{1,16}") && n.toLowerCase(java.util.Locale.ROOT).startsWith(builder.getRemainingLowerCase())) builder.suggest(n);
+								}
+							}
+							return builder.buildFuture();
+						})
+						.executes(ctx -> {
+							openPlayerViewer(ctx.getSource().getClient(), com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "player"), null);
+							return 1;
+						})));
+			}
 
 			// Per user request: real personal /f1-/f7, /m1-/m7, /t1-/t5 slash commands (not just the
 			// party-chat !f1 triggers ChatCommandsFeature already had) — gated on that same feature being
@@ -322,10 +369,18 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 			FeatureCategory.COMBAT, "Slayers", "Blaze",
 			name -> containsAny(name, new String[]{"Flare Demon", "Kindleheart Demon", "Burningsoul Demon"}),
 			0xFFFFAA55));
+		// Per user request: a title alert ("SLAYER MINI-BOSS <name> has spawned!") across every slayer type,
+		// not scoped to any one of them — see MinibossNotificationFeature's own doc comment.
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.MinibossNotificationFeature());
 
 		// Each of these carries a slayerType tag so it only shows under its own Combat > Slayers > <type> tab.
+		// Per user report ("There is also another part of the tier 5 boss where after it dies it turns into a
+		// 'conjoined brood' and keeps going"): Tarantula Broodfather's post-death phase renames the entity
+		// entirely rather than keeping "Tarantula Broodfather" in its name, so the old single-name match
+		// stopped highlighting it the moment that phase started.
 		FeatureRegistry.register(new MobHighlightFeature("tarantula_boss_highlight", "Highlight Tarantula boss",
-			FeatureCategory.COMBAT, "Slayers", "Tarantula", name -> name.contains("Tarantula Broodfather"), 0xFF55FF55));
+			FeatureCategory.COMBAT, "Slayers", "Tarantula",
+			name -> containsAny(name, new String[]{"Tarantula Broodfather", "Conjoined Brood"}), 0xFF55FF55));
 		FeatureRegistry.register(new MobHighlightFeature("voidgloom_boss_highlight", "Highlight Voidgloom boss",
 			FeatureCategory.COMBAT, "Slayers", "Voidgloom", name -> name.contains("Voidgloom Seraph"), 0xFF55FFFF));
 		FeatureRegistry.register(new MobHighlightFeature("blaze_boss_highlight", "Highlight Blaze boss",
@@ -341,6 +396,9 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// see DisableEndermanDeathAnimationFeature/EndermanDeathFlopMixin's own doc comments for the
 		// confirmed vanilla sound ids and render-state mechanism.
 		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.DisableEndermanDeathAnimationFeature());
+		// Combat > Combat — every-mob version of the Enderman-only toggle above; see
+		// HideMobDyingAnimationFeature/HideMobDyingAnimationMixin's own doc comments for why both can coexist.
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.HideMobDyingAnimationFeature());
 	}
 
 	private static boolean containsAny(String name, String[] candidates) {
@@ -389,6 +447,10 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// here) and SkyOcean's DungeonQualityLoreModifier.kt (same 0-50 quality scale, cross-confirming it
 		// independently). See InventoryTooltipFilter's own doc comment for why this lives there.
 		FeatureRegistry.register(new SimpleToggleFeature("show_item_quality", "Show Item Quality (dungeon floor + quality on drops)", FeatureCategory.INVENTORY, "Inventory"));
+		// Per user request ("Add a new module that allows for the old rendering of the master star system...
+		// where they turn red. Skyocean has this. Its called 'Revert master stars'."): source provided —
+		// see InventoryTooltipFilter#revertMasterStars for the ported logic.
+		FeatureRegistry.register(new SimpleToggleFeature("revert_master_stars", "Revert Master Stars", FeatureCategory.INVENTORY, "Inventory"));
 		FeatureRegistry.register(new PersonalCompactorOverlayFeature());
 
 
@@ -671,6 +733,11 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// Damage Splashes (same EntityHideRegistry rule/detection as the combat-wide toggle above, just
 		// a second on/off switch for it) are real.
 		FeatureRegistry.register(new SlayerCocoonAlertFeature());
+		// M7 dragons (ported from Odin) + blessing display.
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.m7.DragonsFeature());
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.m7.DragonPriorityFeature());
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.m7.BlessingDisplayFeature());
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.m7.RelicUtilityFeature());
 
 		// Combat > Slayers > Tarantula — Hide Irrelevant Mobs (was its own "Crimson Isle" subcategory, now
 		// deleted per user request; moved here per the same request). Real vanilla mob TYPES rather than
@@ -682,6 +749,13 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 				&& (entity.getType() == net.minecraft.world.entity.EntityTypes.MAGMA_CUBE
 					|| entity.getType() == net.minecraft.world.entity.EntityTypes.ZOMBIFIED_PIGLIN
 					|| entity.getType() == net.minecraft.world.entity.EntityTypes.CAVE_SPIDER)));
+		// Per user request ("built a 'Highlight egg sacks' accordingly. Use the protocol for highlights"):
+		// the debug tool's own capture confirmed these are invisible ArmorStands wearing a custom player_head
+		// skin, with a "<seconds>s <n>/<n>" custom name (e.g. "13s 9/9") — no vanilla entity type or item
+		// metadata distinguishes them from any other armor stand. A follow-up report ("should only highlight
+		// the ones the slayer boss spawns... within 5 blocks horizontally of the tarantula boss") is why this
+		// is its own subclass rather than a plain name-pattern registration — see its own doc comment.
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.TarantulaEggSackHighlightFeature());
 
 		registerPerformanceFeatures();
 	}
@@ -764,6 +838,15 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 	// predate 1.0.22 now — see registerModuleFeatures() for the current New Modules picks instead.
 	private static void registerOdinSkyblockFeatures() {
 		var playerDisplay = new com.cokelord.skyblocksimplified.feature.impl.PlayerDisplayFeature();
+		// Combat > Combat — per user-captured action bar sample, see ShowKuudraArmorStacksFeature's own doc
+		// comment for the confirmed format.
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.impl.ShowKuudraArmorStacksFeature());
+		// Per user request: "N.Ns lost to lag (N ticks)" after Dungeon/Kuudra runs.
+		com.cokelord.skyblocksimplified.feature.impl.LagCounterFeature lagCounter = new com.cokelord.skyblocksimplified.feature.impl.LagCounterFeature();
+		FeatureRegistry.register(lagCounter);
+		FeatureRegistry.register(new com.cokelord.skyblocksimplified.feature.LinkedFeatureMirror(lagCounter, FeatureCategory.ABOUT, "New Modules"));
+		// Events > Diana — SBO port (per user request); see DianaModule.
+		com.cokelord.skyblocksimplified.diana.DianaModule.register();
 		var noCursorReset = new com.cokelord.skyblocksimplified.feature.impl.NoCursorResetFeature();
 		var autoSprint = new com.cokelord.skyblocksimplified.feature.impl.AutoSprintFeature();
 		var slotBinds = new com.cokelord.skyblocksimplified.feature.impl.SlotBindsFeature();
@@ -795,11 +878,15 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// Inventory > Misc — per user request: mouse-wheel scroll support for any tooltip that's taller than
 		// its own built-in visible cap. See ScrollableTooltipsFeature's own doc comment.
 		var scrollableTooltips = new com.cokelord.skyblocksimplified.feature.impl.ScrollableTooltipsFeature();
+		// Inventory > Misc — per user request ("Do the odin version, theirs works well"): live arrow-count
+		// readout ported from Odin's own QuiverDisplay.kt. See QuiverDisplayFeature's own doc comment for its
+		// two independent detection paths.
+		var quiverDisplay = new com.cokelord.skyblocksimplified.feature.impl.QuiverDisplayFeature();
 
 		java.util.List.<com.cokelord.skyblocksimplified.feature.Feature>of(
 			playerDisplay, noCursorReset, autoSprint, slotBinds, splits, chatCommands, slotLocking, visualWords,
 			commandAliases, commandShortcuts, autoArchitectDraft, removeFontShadow, itemRarityBackground,
-			scrollableTooltips
+			scrollableTooltips, quiverDisplay
 		).forEach(FeatureRegistry::register);
 
 		// removeFontShadow/itemRarityBackground/scrollableTooltips are real recent additions per git history
@@ -808,6 +895,11 @@ public class SkyblockSimplifiedClient implements ClientModInitializer {
 		// predate it.
 		java.util.function.Function<com.cokelord.skyblocksimplified.feature.Feature, com.cokelord.skyblocksimplified.feature.LinkedFeatureMirror> mirror =
 			f -> new com.cokelord.skyblocksimplified.feature.LinkedFeatureMirror(f, FeatureCategory.ABOUT, "New Modules");
+		FeatureRegistry.register(mirror.apply(quiverDisplay));
+		// Inventory > Misc — per user request: blocks Hypixel's forced SkyBlock resource pack (Detexturify port).
+		var removeSkyblockTexturePack = new com.cokelord.skyblocksimplified.feature.impl.RemoveSkyblockTexturePackFeature();
+		FeatureRegistry.register(removeSkyblockTexturePack);
+		FeatureRegistry.register(mirror.apply(removeSkyblockTexturePack));
 		java.util.List.<com.cokelord.skyblocksimplified.feature.Feature>of(removeFontShadow, itemRarityBackground, scrollableTooltips)
 			.forEach(feature -> FeatureRegistry.register(mirror.apply(feature)));
 	}

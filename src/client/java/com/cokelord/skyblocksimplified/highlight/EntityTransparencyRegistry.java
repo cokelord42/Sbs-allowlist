@@ -19,19 +19,28 @@ public final class EntityTransparencyRegistry {
 
 	private record Rule(Predicate<Entity> matcher, int alpha0to255) {}
 
+	// Resolved alpha per entity for the current client tick (see TickCache).
+	private static final TickCache.PerTick<Integer> cache = new TickCache.PerTick<>();
+
 	public static void setRule(String id, Predicate<Entity> matcher, int alpha0to255) {
 		rules.put(id, new Rule(matcher, alpha0to255));
+		cache.clear();
 	}
 
 	public static void clearRule(String id) {
-		rules.remove(id);
+		if (rules.remove(id) != null) cache.clear();
 	}
 
 	/** 255 (fully opaque) if no rule matches this entity, otherwise the first matching rule's alpha. */
 	public static int getAlphaFor(Entity entity) {
+		if (rules.isEmpty()) return 255;
+		Integer cached = cache.get(entity.getId());
+		if (cached != null) return cached;
+		int alpha = 255;
 		for (Rule rule : rules.values()) {
-			if (rule.matcher().test(entity)) return rule.alpha0to255();
+			if (rule.matcher().test(entity)) { alpha = rule.alpha0to255(); break; }
 		}
-		return 255;
+		cache.put(entity.getId(), alpha);
+		return alpha;
 	}
 }

@@ -20,16 +20,26 @@ public final class EntityHideRegistry {
 
 	public static void setRule(String id, Predicate<Entity> matcher) {
 		rules.put(id, matcher);
+		cache.clear();
 	}
 
 	public static void clearRule(String id) {
 		rules.remove(id);
+		cache.clear();
 	}
 
+	// shouldHide runs for every entity every frame (EntityRenderer#shouldRender); cached per tick (TickCache).
+	private static final TickCache.PerTick<Boolean> cache = new TickCache.PerTick<>();
+
 	public static boolean shouldHide(Entity entity) {
+		if (rules.isEmpty()) return false;
+		Boolean hit = cache.get(entity.getId());
+		if (hit != null) return hit;
+		boolean hide = false;
 		for (Predicate<Entity> matcher : rules.values()) {
-			if (matcher.test(entity)) return true;
+			if (matcher.test(entity)) { hide = true; break; }
 		}
-		return false;
+		cache.put(entity.getId(), hide);
+		return hide;
 	}
 }

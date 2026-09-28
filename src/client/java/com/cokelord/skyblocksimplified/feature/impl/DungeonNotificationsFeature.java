@@ -407,9 +407,10 @@ public class DungeonNotificationsFeature extends Feature implements MoveableWidg
 	 *  the local player is party leader, show a title on screen"). Distinct from ChatCommandsFeature's own
 	 *  pre-existing "!dt" reminder-queue system, which still runs unaffected — this is purely an immediate
 	 *  on-screen alert so a busy leader notices the request right away instead of only at run-end. */
-	public static void fireDowntimeRequest(String username, String reason) {
-		if (instance == null || !instance.isEnabled() || !instance.isTypeEnabled(NotificationType.DT_REQUEST)) return;
-		instance.fire(NotificationType.DT_REQUEST, "DT! " + username + " \"" + reason + "\"", username);
+	public static boolean fireDowntimeRequest(String username, String titleText) {
+		if (instance == null || !instance.isEnabled() || !instance.isTypeEnabled(NotificationType.DT_REQUEST)) return false;
+		instance.fire(NotificationType.DT_REQUEST, titleText, username);
+		return true;
 	}
 
 	/** Called by {@link SimonSaysFeature} the moment its own tracked solution empties on a correct final

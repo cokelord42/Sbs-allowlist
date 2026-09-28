@@ -69,11 +69,14 @@ import java.util.Set;
  * {@link #renderInner} already draws in the world, so the two views always agree. Per a same-round follow-up
  * ("make it safe for restarting aswell, so if i turn off the device and such it should hide the display and
  * when the simon says is active it should reshow... bake it into the simon says module we already have
- * instead of making a new module"): kept as part of this same class rather than split out, and its visibility
- * is driven directly off {@link #solution} — restarting the device via the start button (or a fresh Goldor
- * greeting) calls {@link #resetSolution}, which empties {@code solution} and hides the grid immediately, and
- * it reappears the instant the next lantern reveal repopulates it, with no separate "device active" flag to
- * keep in sync.
+ * instead of making a new module"): kept as part of this same class rather than split out, with a dedicated
+ * {@link #deviceActive} flag driving visibility — true from the very first lantern reveal, cleared only by a
+ * genuine reset (start button / fresh Goldor greeting, via {@link #resetSolution}) or real full-device
+ * completion. Deliberately NOT tied to {@link #solution}'s own emptiness (an earlier version was): that list
+ * also empties out for a moment at the end of every ordinary intermediate round, indistinguishable from a
+ * real reset by itself, which hid the grid between every round instead of only when actually intended (per
+ * user report — "make it so the simon says display doesnt hide at all until simon says is finished, it hides
+ * between rounds which i dont really like").
  */
 public class SimonSaysFeature extends Feature implements MoveableWidget {
 	private static final BlockPos START_BUTTON = new BlockPos(110, 121, 91);
@@ -127,6 +130,17 @@ public class SimonSaysFeature extends Feature implements MoveableWidget {
 	// round. isVisible() below hides the widget 3 real seconds after this, independent of resetSolution()
 	// (a fresh Goldor greeting / new device attempt) which still clears it back to "not shown yet" instantly.
 	private long fiveOfFiveAtMillis = 0L;
+	// Real bug found (per user report — "make it so the simon says display doesnt hide at all until simon
+	// says is finished, it hides between rounds which i dont really like"): isVisible() used to key off
+	// !solution.isEmpty() as its "device is active" signal — but solution ALSO empties out for a moment at
+	// the end of every ordinary intermediate round (the player's last correct click of that round consumes
+	// its final entry, and nothing repopulates it until the NEXT round's lantern reveal starts), not just on
+	// a genuine reset. That's indistinguishable from "the device was just reset" using solution alone, so
+	// the grid hid itself between every single round instead of only when it was actually supposed to
+	// (start-button reset, a fresh Goldor greeting, or real full-device completion). Tracked as its own flag
+	// instead: true from the very first lantern reveal, false only on a genuine resetSolution() call or once
+	// the whole device (not just one round) is actually finished — see those exact set sites below.
+	private boolean deviceActive = false;
 
 	private static boolean listenersRegistered = false;
 	private static SimonSaysFeature instance;
@@ -181,6 +195,7 @@ public class SimonSaysFeature extends Feature implements MoveableWidget {
 
 	private void resetSolution() {
 		solution.clear();
+		deviceActive = false;
 		skipOver = false;
 		roundLength = 0;
 		stage = 0;
@@ -208,6 +223,7 @@ public class SimonSaysFeature extends Feature implements MoveableWidget {
 			var previous = lastGridState.get(lanternPos);
 			lastGridState.put(lanternPos, block);
 			if (previous == Blocks.OBSIDIAN && block == Blocks.SEA_LANTERN) {
+				deviceActive = true;
 				BlockPos buttonPos = lanternPos.offset(-1, 0, 0);
 				if (ssSkipCompat && solution.size() == 2 && !skipOver) {
 					solution.remove(0);
@@ -272,6 +288,7 @@ public class SimonSaysFeature extends Feature implements MoveableWidget {
 				// actually finishing, not just one round of it (see roundLength's own doc comment). Also the
 				// same instant the widget's own 3-second auto-hide countdown (see fiveOfFiveAtMillis) starts.
 				if (stage >= 5) {
+					deviceActive = false;
 					fiveOfFiveAtMillis = System.currentTimeMillis();
 					DungeonNotificationsFeature.fireSimonSaysComplete();
 				}
@@ -325,10 +342,11 @@ public class SimonSaysFeature extends Feature implements MoveableWidget {
 	public boolean isVisible() {
 		if (!isEnabled() || !progressDisplay || DungeonState.getF7Phase() != DungeonState.F7Phase.P3) return false;
 		// Per the mid-turn follow-up ("if i turn off the device and such it should hide the display and when
-		// the simon says is active it should reshow"): tied directly to `solution` rather than a separate
-		// "device active" flag — resetSolution() (start button / fresh Goldor greeting) empties it and hides
-		// the grid immediately, and the very next lantern reveal repopulates it and brings the grid back.
-		if (!solution.isEmpty()) return true;
+		// the simon says is active it should reshow"): true from the first lantern reveal until either a
+		// genuine reset (start button / fresh Goldor greeting — see resetSolution) or real full-device
+		// completion (see the stage>=5 branch in onBlockInteract) — NOT tied to solution's own emptiness,
+		// which is also momentarily true between every ordinary round and used to hide the grid then too.
+		if (deviceActive) return true;
 		// Per user request ("make it automatically hide after 3 seconds of being 5/5"): keeps the completed
 		// grid on screen briefly once the whole device (not just one round of it) is solved, same grace
 		// window this widget has always used, before disappearing until the next attempt.

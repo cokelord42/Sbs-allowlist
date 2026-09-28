@@ -15,6 +15,8 @@ import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.ItemLore;
 
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -63,6 +65,20 @@ public class HighlightPartiesFeature extends Feature {
 	@Override
 	public String getSubcategory() { return "Dungeons"; }
 
+	// Perf: renderHighlights runs once per real render FRAME for as long as the Party Finder listing screen
+	// is open (PreItemRenderRegistry, not a once-per-tick/chat-line hook) — compiling classWord fresh in
+	// there recompiled the same regex hundreds of times a second, matching the exact per-frame regex-compile
+	// cost this codebase has already found and fixed elsewhere (see e.g. CroesusFeature's own COST_PATTERN
+	// doc comment). Only 5 real DungeonClass values ever need a pattern here, so all 5 are cached once
+	// instead of recompiled per class-lookup.
+	private static final Map<DungeonClass, Pattern> CLASS_WORD_PATTERNS = new EnumMap<>(DungeonClass.class);
+	static {
+		for (DungeonClass clazz : DungeonClass.values()) {
+			if (clazz == DungeonClass.EMPTY) continue;
+			CLASS_WORD_PATTERNS.put(clazz, Pattern.compile("\\b" + clazz.name() + "\\b", Pattern.CASE_INSENSITIVE));
+		}
+	}
+
 	private void renderHighlights(net.minecraft.client.gui.GuiGraphicsExtractor graphics, AbstractContainerScreen<?> screen) {
 		DungeonClass selfClass = SelfClassCache.get();
 		// Real bug found (per user report — "the party highlight shouldn't highlight anything if the mod
@@ -73,7 +89,8 @@ public class HighlightPartiesFeature extends Feature {
 		// Word-boundary, case-insensitive search for the local player's own class name — real Hypixel class
 		// names (Healer/Mage/Tank/Archer/Berserk) match DungeonClass's own enum constant names case-
 		// insensitively, so this needs no separate name table.
-		Pattern classWord = Pattern.compile("\\b" + selfClass.name() + "\\b", Pattern.CASE_INSENSITIVE);
+		Pattern classWord = CLASS_WORD_PATTERNS.get(selfClass);
+		if (classWord == null) return;
 
 		var allSlots = screen.getMenu().slots;
 		for (int slotId : PARTY_SLOTS) {

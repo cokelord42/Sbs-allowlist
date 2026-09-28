@@ -9,8 +9,10 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.decoration.ArmorStand;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -48,6 +50,18 @@ public class DamageTruncatorFeature extends Feature {
 
 	private static DamageTruncatorFeature instance;
 
+	// Per user report ("The truncator color coding doesnt stick. It updates every tick instead of just
+	// applying once then freezing. This causes the truncated damage splash to bug out and really quickly
+	// switch between uncolored and colored"): computeOverrideName has to keep running every frame (see this
+	// class's own doc comment for why), but re-deriving the truncated/colored text fresh each time meant any
+	// single frame where DamageSplashDetector/the regex below failed to match this same entity's own
+	// customName (its Component apparently isn't perfectly stable moment to moment) fell all the way back to
+	// the untouched raw name for that one frame, then back to truncated the next — a rapid flicker between
+	// the two. The first successful computation for a given splash entity is now cached by entity id and
+	// reused unconditionally for the rest of that entity's short life (removed the moment it dies), so a
+	// splash can flicker at most once, on the way TO its final truncated/colored text, never back and forth.
+	private static final Map<Integer, Component> frozenOverrides = new HashMap<>();
+
 	private int decimals = 1;
 
 	public DamageTruncatorFeature() {
@@ -64,7 +78,25 @@ public class DamageTruncatorFeature extends Feature {
 	 *  (feature off, not a damage splash, or a value under 1000 that already reads fine as-is). */
 	public static Component computeOverrideName(Entity entity) {
 		if (instance == null || !instance.isEnabled()) return null;
-		if (!(entity instanceof ArmorStand) || !DamageSplashDetector.isDamageSplash(entity)) return null;
+		if (!(entity instanceof ArmorStand)) return null;
+		if (!entity.isAlive()) {
+			frozenOverrides.remove(entity.getId());
+			return null;
+		}
+		Component frozen = frozenOverrides.get(entity.getId());
+		if (frozen != null) return frozen;
+		// Armor stands that aren't (yet) a truncatable splash are re-checked once per tick, not every frame.
+		if (notSplashThisTick.get(entity.getId()) != null) return null;
+		Component computed = computeFresh(entity);
+		if (computed == null) notSplashThisTick.put(entity.getId(), Boolean.TRUE);
+		return computed;
+	}
+
+	private static final com.cokelord.skyblocksimplified.highlight.TickCache.PerTick<Boolean> notSplashThisTick =
+		new com.cokelord.skyblocksimplified.highlight.TickCache.PerTick<>();
+
+	private static Component computeFresh(Entity entity) {
+		if (!DamageSplashDetector.isDamageSplash(entity)) return null;
 		Component customName = entity.getCustomName();
 		if (customName == null) return null;
 		String raw = customName.getString();
@@ -94,7 +126,9 @@ public class DamageTruncatorFeature extends Feature {
 		boolean trueDamage = !matcher.group(1).isEmpty() || matcher.group(3).indexOf('✧') >= 0 || matcher.group(3).indexOf('✯') >= 0;
 		String truncated = instance.truncate(value);
 		String colored = trueDamage ? rainbow(truncated) : "§3" + truncated;
-		return Component.literal(matcher.group(1) + colored + matcher.group(3));
+		Component result = Component.literal(matcher.group(1) + colored + matcher.group(3));
+		frozenOverrides.put(entity.getId(), result);
+		return result;
 	}
 
 	// Ported from NoammAddons' addRandomColorCodes: a random legacy color per character, never repeating

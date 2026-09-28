@@ -219,9 +219,11 @@ public class MimicFeature extends Feature {
 
 	private void sendPartyChat(String message) {
 		Minecraft mc = Minecraft.getInstance();
-		if (mc.player != null && mc.player.connection != null) {
-			mc.player.connection.sendCommand("pc " + message);
-		}
+		// Always sent from the main thread: a send from the network thread (packet handlers) could fail
+		// silently while the kill was already marked, so the map updated but no message went out.
+		mc.execute(() -> {
+			if (mc.player != null && mc.player.connection != null) mc.player.connection.sendCommand("pc " + message);
+		});
 	}
 
 	public boolean isMimicMessageEnabled() { return mimicMessageEnabled; }

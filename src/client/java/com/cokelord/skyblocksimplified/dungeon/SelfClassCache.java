@@ -2,6 +2,7 @@ package com.cokelord.skyblocksimplified.dungeon;
 
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.core.component.DataComponents;
@@ -9,6 +10,10 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.ItemLore;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
@@ -101,20 +106,57 @@ public final class SelfClassCache {
 	private static final Pattern COLOR_CODE = Pattern.compile("§.");
 	private static final int HUB_SCAN_INTERVAL_TICKS = 10; // ~500ms at a real 20 TPS, per user request.
 
+	// Real bug found (per user report — "class caching still isn't a thing"): this was a pure in-memory
+	// static field with no disk persistence at all, unlike every real Feature in this codebase (which all
+	// round-trip through ConfigManager's savePersistedData/loadPersistedData). Since this class isn't a
+	// Feature (no FeatureRegistry participation, no settings-panel presence), it can't just plug into that
+	// existing per-feature JSON map — instead it gets its own tiny plain-text file (same convention
+	// EquipmentDisplayFeature already uses for its own separate per-profile NBT cache file), holding nothing
+	// but the resolved DungeonClass's own enum name. Written only when the cached value actually CHANGES (see
+	// set() below), not on every one of the 4 sources' repeated re-confirmations of the same class, and read
+	// back once at register() — so the very first hub sidebar/tablist tick after a relaunch already has last
+	// session's real class instead of needing to wait for a fresh live detection.
+	private static final Path SELF_CLASS_FILE =
+		FabricLoader.getInstance().getConfigDir().resolve("skyblocksimplified").resolve("self_class.txt");
+
 	private static volatile DungeonClass cached = null;
 	private static boolean registered = false;
 	private static int hubScanTickCounter = 0;
 
-	/** Null until a real class has actually been observed this session (no guessing/defaulting). */
+	/** Null until a real class has ever been observed (this session, or a persisted one from a previous
+	 *  session — see {@link #SELF_CLASS_FILE}'s own doc comment) — no guessing/defaulting. */
 	public static DungeonClass get() { return cached; }
 
 	public static void set(DungeonClass clazz) {
-		if (clazz != null && clazz != DungeonClass.EMPTY) cached = clazz;
+		if (clazz == null || clazz == DungeonClass.EMPTY || clazz == cached) return;
+		cached = clazz;
+		persistToDisk(clazz);
+	}
+
+	private static void persistToDisk(DungeonClass clazz) {
+		try {
+			Files.createDirectories(SELF_CLASS_FILE.getParent());
+			Files.writeString(SELF_CLASS_FILE, clazz.name(), StandardCharsets.UTF_8);
+		} catch (IOException e) {
+			com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error(
+				"SelfClassCache: failed to persist class to disk", e);
+		}
+	}
+
+	private static void loadFromDisk() {
+		if (!Files.exists(SELF_CLASS_FILE)) return;
+		try {
+			cached = DungeonClass.valueOf(Files.readString(SELF_CLASS_FILE, StandardCharsets.UTF_8).strip());
+		} catch (Exception e) {
+			com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error(
+				"SelfClassCache: failed to load persisted class, starting blank", e);
+		}
 	}
 
 	public static void register() {
 		if (registered) return;
 		registered = true;
+		loadFromDisk();
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
 			if (!(screen instanceof AbstractContainerScreen<?> containerScreen)) return;
 			// Real bug found (per user report — "the mod doesnt keep searching inside the gui and only procs

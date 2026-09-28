@@ -27,10 +27,10 @@ public class GuiAnimationsFeature extends Feature {
 	private float closeDuration = 0.3f;
 	private float expandDuration = 0.4f;
 	private float searchDuration = 0.5f;
-	// Per user request ("Changing categories should also have an animation... make sure all animations can
-	// be disabled/sped up in the gui animations module"): the category-sidebar / flat-subcategory-tab
-	// crossfade — see MainScreen's contentSwapFadeAnim/triggerContentSwap.
-	private float contentSwitchDuration = 0.3f;
+	// Per user report ("Remove the category switch slider from the mod animations module. It doesnt
+	// actually do anything anymore"): confirmed and removed — MainScreen's triggerContentSwap() now always
+	// applies a category/subcategory change instantly (an earlier user request replaced the crossfade this
+	// duration used to drive with an instant switch), so the field had nothing left to control.
 	private int blurAmount = 0;
 	private boolean cogSpinEnabled = true;
 	private boolean sliderAnimationEnabled = true;
@@ -42,6 +42,8 @@ public class GuiAnimationsFeature extends Feature {
 	// can turn off just scroll easing (e.g. if it feels laggy on a heavy scroll) without losing every other
 	// GUI animation, or vice versa.
 	private boolean scrollAnimationEnabled = true;
+	// Per user request: drifting accent-colored bubbles behind the mod's own menus (GuiBubbles).
+	private boolean backgroundBubbles = true;
 	// Per user request ("Remove the subtoggle for the squircle corners as they are default and the toggle
 	// does nothing") — squircle corners are no longer a separate opt-in shape; RenderUtil now always uses
 	// them for every non-forceCircle rounded element (see its own doc comment), so the setting that used to
@@ -103,14 +105,6 @@ public class GuiAnimationsFeature extends Feature {
 		searchDuration = clamp(seconds);
 	}
 
-	public float getContentSwitchDuration() {
-		return contentSwitchDuration;
-	}
-
-	public void setContentSwitchDuration(float seconds) {
-		contentSwitchDuration = clamp(seconds);
-	}
-
 	/** 0-10, matching vanilla's own menu-background-blur option exactly (it only has 11 discrete
 	 *  steps — MAX_BLUR_RADIUS is hardcoded to 10 — so a finer-grained slider would just be lossily
 	 *  rounded down to these same 11 values anyway). Drives a temporary, save-and-restore override of
@@ -153,6 +147,9 @@ public class GuiAnimationsFeature extends Feature {
 		this.scrollAnimationEnabled = scrollAnimationEnabled;
 	}
 
+	public boolean isBackgroundBubbles() { return backgroundBubbles; }
+	public void setBackgroundBubbles(boolean v) { backgroundBubbles = v; }
+
 	@Override
 	public Map<String, Float> getPersistedFloats() {
 		Map<String, Float> values = new HashMap<>();
@@ -160,11 +157,11 @@ public class GuiAnimationsFeature extends Feature {
 		values.put("close", closeDuration);
 		values.put("expand", expandDuration);
 		values.put("search", searchDuration);
-		values.put("contentSwitch", contentSwitchDuration);
 		values.put("blur", (float) blurAmount);
 		values.put("cogSpin", cogSpinEnabled ? 1f : 0f);
 		values.put("sliderAnim", sliderAnimationEnabled ? 1f : 0f);
 		values.put("scrollAnim", scrollAnimationEnabled ? 1f : 0f);
+		values.put("bubbles", backgroundBubbles ? 1f : 0f);
 		return values;
 	}
 
@@ -174,16 +171,19 @@ public class GuiAnimationsFeature extends Feature {
 		if (values.containsKey("close")) closeDuration = clamp(values.get("close"));
 		if (values.containsKey("expand")) expandDuration = clamp(values.get("expand"));
 		if (values.containsKey("search")) searchDuration = clamp(values.get("search"));
-		if (values.containsKey("contentSwitch")) contentSwitchDuration = clamp(values.get("contentSwitch"));
 		if (values.containsKey("blur")) blurAmount = Math.round(values.get("blur"));
 		if (values.containsKey("cogSpin")) cogSpinEnabled = values.get("cogSpin") >= 0.5f;
 		if (values.containsKey("sliderAnim")) sliderAnimationEnabled = values.get("sliderAnim") >= 0.5f;
 		if (values.containsKey("scrollAnim")) scrollAnimationEnabled = values.get("scrollAnim") >= 0.5f;
+		if (values.containsKey("bubbles")) backgroundBubbles = values.get("bubbles") >= 0.5f;
 		// "squircleCorners"/"pixelatedLook" keys from an older config are silently ignored — squircle is
 		// unconditional and pixelated is now the only rendering mode, per user request, nothing left for
 		// either to control.
 		// "tileTransition"/"flatSubcategories" keys from an older config are silently ignored — the
 		// tile-grid subcategory system they controlled is gone entirely now, per user request.
+		// "contentSwitch" key from an older config is silently ignored — see the removed field's own doc
+		// comment above (moved to this class's own history): it drove a crossfade duration that a later
+		// user request already replaced with an instant switch, leaving it with nothing left to control.
 	}
 
 	@Override

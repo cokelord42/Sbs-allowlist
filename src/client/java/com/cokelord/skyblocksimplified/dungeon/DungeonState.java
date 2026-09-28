@@ -247,6 +247,8 @@ public final class DungeonState {
 	private static int openedRooms = 0;
 	private static int completedRooms = 0;
 	private static int clearedPercent = 0;
+	private static boolean expectingBloodUpdate = false;
+	private static boolean bloodDone = false;
 	private static int deaths = 0;
 	// Per user request ("On the first death, it should pull api data about the player that died and if they
 	// have a legendary spirit pet in their pets menu the death should only be a -1"): real Hypixel dungeon
@@ -409,6 +411,8 @@ public final class DungeonState {
 	public static int getOpenedRooms() { return openedRooms; }
 	public static int getCompletedRooms() { return completedRooms; }
 	public static int getClearedPercent() { return clearedPercent; }
+	/** Blood room done (Watcher beaten and the tab list's cleared % has updated for it). */
+	public static boolean isBloodDone() { return bloodDone; }
 	public static int getDeaths() { return deaths; }
 	/** Real username of whoever died FIRST this run, or null if nobody has died yet — see the field's own
 	 *  doc comment for why only the first death matters here. */
@@ -499,6 +503,9 @@ public final class DungeonState {
 		if (!watcherGateActive && floorNumber == 7 && BLOOD_DOOR_OPEN_PATTERN.matcher(text).find()) {
 			watcherGateActive = true;
 		}
+		// Score (Odin's DungeonListener): Blood only counts as a completed room in the tab list's own count
+		// once the Watcher is beaten, which is marked by the next "Cleared: N%" change after this line.
+		if (WATCHER_PORTAL_ENTRY_PATTERN.matcher(text).find()) expectingBloodUpdate = true;
 		if (watcherGateActive && WATCHER_PORTAL_ENTRY_PATTERN.matcher(text).find()) {
 			watcherGateActive = false;
 		}
@@ -846,7 +853,11 @@ public final class DungeonState {
 				try { completedRooms = Integer.parseInt(m.group(1)); } catch (NumberFormatException ignored) {}
 			}
 			if ((m = CLEARED_PERCENT_PATTERN.matcher(line)).find()) {
-				try { clearedPercent = Integer.parseInt(m.group(1)); } catch (NumberFormatException ignored) {}
+				try {
+					int parsed = Integer.parseInt(m.group(1));
+					if (parsed != clearedPercent && expectingBloodUpdate) bloodDone = true;
+					clearedPercent = parsed;
+				} catch (NumberFormatException ignored) {}
 			}
 			if ((m = OPENED_ROOMS_PATTERN.matcher(line)).find()) {
 				try { openedRooms = Integer.parseInt(m.group(1)); } catch (NumberFormatException ignored) {}
@@ -918,6 +929,17 @@ public final class DungeonState {
 	// 7" from "the scan runs every tick but never finds an entity named Maxor" without another guess.
 	private static long lastMaxorScanLogMillis = 0L;
 
+	// Real cost found (per a perf-optimization pass): this scan runs every single client tick for as long as
+	// the player is on F7 and Maxor's own boss-entry line hasn't fired yet — which can be minutes of ordinary
+	// F7 exploration before the boss room is even reached — and every tick calls entity.getName().getString()
+	// (a fresh Component-to-String render, allocating a new String) on every entity in render distance, purely
+	// as a REDUNDANT fallback: two other signals (the Watcher portal line and Maxor's own chat greeting) are
+	// already checked first and already fire for the vast majority of runs. Opt-in via Performance Toggles
+	// (default off — unthrottled, matching this scan's original behavior) rather than always-on, since
+	// throttling has a real, if minor, tradeoff: up to a few hundred ms slower confirmation on the rare run
+	// where this scan is genuinely the fastest of the three signals to fire.
+	private static int maxorScanTickCounter = 0;
+
 	/** Third, independent signal for "the F7 boss fight has started" alongside the coordinate check and the
 	 *  chat-line match — per user report, Positional Messages (gated on isInBoss() + floor 7) sometimes
 	 *  never triggers for the whole fight, and computeInBoss()'s coordinate boundaries are already flagged
@@ -927,6 +949,8 @@ public final class DungeonState {
 	 *  bossEntryMessageSeen rather than a new flag since both mean the same thing: "confirmed by a reliable
 	 *  signal, not just the coordinate guess." */
 	private static void checkForMaxorEntity() {
+		if (com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isThrottleMaxorScan()
+				&& maxorScanTickCounter++ % 5 != 0) return;
 		Minecraft mc = Minecraft.getInstance();
 		if (mc.level == null) return;
 		int scanned = 0;
@@ -974,6 +998,8 @@ public final class DungeonState {
 		openedRooms = 0;
 		completedRooms = 0;
 		clearedPercent = 0;
+		expectingBloodUpdate = false;
+		bloodDone = false;
 		deaths = 0;
 		firstDeathPlayerName = null;
 		elapsedTime = "0s";

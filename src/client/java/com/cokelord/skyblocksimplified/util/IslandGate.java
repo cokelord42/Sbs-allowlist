@@ -46,7 +46,7 @@ public final class IslandGate {
 	// every call.
 	private static final Pattern COLOR_CODE = Pattern.compile("§.");
 
-	// The one currently-confirmed tracked area key ("dungeon"/"kuudra"/"garden"/"crimson"/"burning_desert"),
+	// The one currently-confirmed tracked area key ("dungeon"/"kuudra"/"garden"/"crimson"/"galatea"),
 	// or null if none has been confirmed (yet, or since the last hub visit/level change) — sidebar-fallback
 	// state only; whenever the Mod API bridge has a confirmed value, that's used instead and this is unused.
 	private static String currentArea = null;
@@ -115,12 +115,36 @@ public final class IslandGate {
 		return isOnIsland("foraging_2", "galatea", "Moonglade Marsh");
 	}
 
-	/** The Burning Desert area specifically (within Crimson Isle) — the scoreboard shows this as its own
-	 *  area line, narrower than just "on Crimson Isle somewhere"; Hypixel's Mod API doesn't expose a
-	 *  separate island id for it (it's a sub-area of Crimson Isle, not its own island), so this stays
-	 *  sidebar-only regardless of whether the Mod API bridge is active. */
+	// Per user request ("there are other magma cubes in the crimson isle and they need to be visible.
+	// Instead, can we use aabb coordinates to figure out if the user is in the burning desert?") — real
+	// world coordinates the user provided, defining the two opposite corners of the Burning Desert area.
+	private static final double BURNING_DESERT_MIN_X = -656;
+	private static final double BURNING_DESERT_MAX_X = -458;
+	// Per user request ("The new AABB boxes for the burning desert should have no height. It should be
+	// infinite vertically ish"): widened from the original real corner Y values (87-120) to a much taller,
+	// effectively "don't gate on height at all" range — the X/Z box is what actually defines the area; Y was
+	// never meant to exclude a real player standing slightly above/below the original two corners' own Y.
+	private static final double BURNING_DESERT_MIN_Y = 50;
+	private static final double BURNING_DESERT_MAX_Y = 200;
+	private static final double BURNING_DESERT_MIN_Z = -894;
+	private static final double BURNING_DESERT_MAX_Z = -644;
+
+	/** The Burning Desert area specifically (within Crimson Isle) — a plain AABB position check against real
+	 *  world coordinates the user provided, replacing an earlier sidebar-text approach. The sidebar version
+	 *  was gating Hide Irrelevant Mobs on "anywhere on Crimson Isle showing 'Burning Desert' in the sidebar,"
+	 *  which doesn't actually mean "standing in the specific sub-area" — magma cubes/zombified piglins/cave
+	 *  spiders elsewhere on Crimson Isle (real mobs, meant to stay fully visible) got the same low-opacity
+	 *  treatment as long as the sidebar text matched, regardless of the player's actual position. A real
+	 *  position check has no such gap and needs no Mod API/sidebar fallback at all. */
 	public static boolean isInBurningDesert() {
-		return checkArea("burning_desert", "Burning Desert");
+		var player = Minecraft.getInstance().player;
+		if (player == null) return false;
+		double x = player.getX();
+		double y = player.getY();
+		double z = player.getZ();
+		return x >= BURNING_DESERT_MIN_X && x <= BURNING_DESERT_MAX_X
+			&& y >= BURNING_DESERT_MIN_Y && y <= BURNING_DESERT_MAX_Y
+			&& z >= BURNING_DESERT_MIN_Z && z <= BURNING_DESERT_MAX_Z;
 	}
 
 	/** True while playing a local/singleplayer world (including one opened to LAN) — i.e. definitely NOT
@@ -158,6 +182,30 @@ public final class IslandGate {
 		}
 		return false;
 	}
+
+	/** The Skyblock Hub island specifically. Mod API mode "hub" when available, otherwise the tab list's own
+	 *  "Area: Hub" line (read at most once per second). */
+	public static boolean isInHub() {
+		resetOnLevelChange();
+		if (Minecraft.getInstance().level == null) return false;
+		if (isModApiActive()) {
+			String mode = HypixelLocationApi.currentIslandMode();
+			if (mode != null) return "hub".equals(mode);
+		}
+		long now = System.currentTimeMillis();
+		if (now - hubTabCheckedAt > 1000) {
+			hubTabCheckedAt = now;
+			hubFromTab = false;
+			for (String line : com.cokelord.skyblocksimplified.hud.TabListReader.readLines()) {
+				String plain = line.replaceAll("§.", "").trim();
+				if (plain.equals("Area: Hub")) { hubFromTab = true; break; }
+			}
+		}
+		return hubFromTab;
+	}
+
+	private static long hubTabCheckedAt = 0;
+	private static boolean hubFromTab = false;
 
 	public static boolean isInHubOrLobby() {
 		resetOnLevelChange();
@@ -252,8 +300,7 @@ public final class IslandGate {
 		"kuudra", new String[]{"Kuudra"},
 		"garden", new String[]{"Garden"},
 		"crimson", new String[]{"Crimson Isle"},
-		"galatea", new String[]{"Moonglade Marsh"},
-		"burning_desert", new String[]{"Burning Desert"}
+		"galatea", new String[]{"Moonglade Marsh"}
 	);
 
 	private static boolean matchesAnyOtherKnownIsland(List<String> plainLines, String excludeKey) {

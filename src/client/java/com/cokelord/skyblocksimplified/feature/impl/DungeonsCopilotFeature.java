@@ -94,7 +94,12 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 	// state to flip on. BLOCK_WATCH couldn't already cover this despite looking similar: it only compares
 	// the block's TYPE name against a target string, and a lever's type never changes when flipped (only its
 	// blockstate's POWERED property does) — see isLeverFlippedSatisfied's own doc comment.
-	public enum StepType { TITLE, BREAKABLE_BLOCKS, WAYPOINT, DEVICE_FINISHED, LEAP_USED, TERMINAL_DONE, BLOCK_WATCH, LEVER_FLIPPED }
+	// Per user request (Boss Guide support for M7 phase 5): RELIC_PICKED_UP (a relic appears in the hotbar),
+	// RELIC_PLACED (it leaves the hotbar again) and DRAGON_DEAD (M7Dragons' Odin-ported death detection; the
+	// Nth Dragon Dead step of a class waits for the Nth dragon death of the run, so a kill that lands a
+	// moment before the guide reaches the step still counts). Appended so saved configs keep their types.
+	public enum StepType { TITLE, BREAKABLE_BLOCKS, WAYPOINT, DEVICE_FINISHED, LEAP_USED, TERMINAL_DONE, BLOCK_WATCH, LEVER_FLIPPED,
+		RELIC_PICKED_UP, RELIC_PLACED, DRAGON_DEAD }
 
 	// Per user request ("Add 'SS/LEVERS/ALIGN/ARROWS device finished' support to the boss guide... Also add
 	// lightning finished support"): which real F7 device this step is waiting on.
@@ -165,6 +170,22 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 			case ALIGN -> DungeonState.TerminalSection.S3;
 			case ARROWS -> DungeonState.TerminalSection.S4;
 		};
+	}
+
+	/** Devices seen finishing before their own section was active this fight (see onChatMessage). */
+	private final java.util.EnumSet<DeviceKind> preCompletedDevices = java.util.EnumSet.noneOf(DeviceKind.class);
+
+	private static boolean sectionMatches(DeviceKind device, DungeonState.TerminalSection current) {
+		return current != DungeonState.TerminalSection.NONE && sectionFor(device).ordinal() + 1 >= current.ordinal();
+	}
+
+	// Devices can be completed while their section isn't active yet: the S2 early-enterer can finish the
+	// Levers device during S1. Hypixel's "completed a device!" line never names the device, so a completion
+	// during S1 while the completer (or, if they aren't loaded, anyone) stands in Early Enter Detection's
+	// EE2 box — the Levers device is inside it — is treated as the Levers device, not Simon Says.
+	private static DeviceKind deviceCompletedBy(String playerName) {
+		if (DungeonState.getTerminalSection() != DungeonState.TerminalSection.S1) return null;
+		return EarlyEnterDetectionFeature.isInSection2Box(playerName) ? DeviceKind.LEVERS : null;
 	}
 
 	// Real Hypixel message the LOCAL client receives immediately after any successful Spirit Leap teleport —
@@ -376,7 +397,28 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 				if (instance == null) return;
 				instance.currentStep = 0;
 				instance.wasInBoss = false;
+				instance.preCompletedDevices.clear();
 			});
+		}
+		// Real bug found (per user report — "if i disabled and enabled it in boss it broke completely and
+		// forgot to render steps"): onTick (where currentStep normally gets (re)initialized on the real
+		// "just entered boss" transition) only ever runs while the feature is enabled — disabling mid-fight
+		// freezes wasInBoss at whatever it was, so re-enabling during that SAME fight never sees inBoss go
+		// false->true again and skips the reinit entirely. That's harmless if currentStep already held a
+		// real, still-valid step number for the active class, but leaves nothing rendering if it didn't (a
+		// fresh instance default of 0, or a step number that no longer exists for this run's class) — this
+		// runs on every enable, not just the very first one, and only touches state if it's actually
+		// invalid, so genuine in-progress steps are never reset out from under the player.
+		if (inRealBossFight()) {
+			DungeonClass activeClass = resolveActiveClass();
+			boolean currentStepValid = false;
+			for (CopilotItem item : items) {
+				if (item.forClass == activeClass && item.stepNumber == currentStep) { currentStepValid = true; break; }
+			}
+			if (!currentStepValid) currentStep = firstStepFor(activeClass);
+			wasInBoss = true;
+		} else {
+			wasInBoss = false;
 		}
 	}
 
@@ -391,6 +433,11 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 	 *  is done, move on" path (WAYPOINT/BREAKABLE_BLOCKS completion in {@link #onTick}, and both
 	 *  DEVICE_FINISHED completion paths below) so a completed device always advances PAST its own step
 	 *  instead of just becoming/staying the current step. */
+	/** 1-based position of {@code item} among the class's Dragon Dead steps, in step order. */
+	private static int dragonDeadOrdinal(List<CopilotItem> items, CopilotItem item) {
+		return (int) items.stream().filter(i -> i.type == StepType.DRAGON_DEAD && i.stepNumber <= item.stepNumber).count();
+	}
+
 	private static int nextStepAfter(List<CopilotItem> items, int afterStep) {
 		return items.stream().mapToInt(i -> i.stepNumber).filter(n -> n > afterStep).min().orElse(afterStep);
 	}
@@ -411,6 +458,7 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 		// never satisfy more than one step transition.
 		myItems.sort(java.util.Comparator.comparingInt(i -> i.stepNumber));
 		Boolean isAnyDeviceCompletedLine = null;
+		DeviceKind completedDevice = null;
 		Boolean isLocalLeapCompleted = null;
 		Boolean isLocalTerminalActivated = null;
 		for (CopilotItem item : myItems) {
@@ -426,7 +474,9 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 				// state check in onTick handles this step instead, so the chat line is ignored here.
 				if (item.pdMode && (item.deviceKind == DeviceKind.ALIGN || item.deviceKind == DeviceKind.LEVERS)) continue;
 				if (isAnyDeviceCompletedLine == null) {
-					isAnyDeviceCompletedLine = DEVICE_COMPLETED_PATTERN.matcher(text).matches();
+					Matcher deviceMatch = DEVICE_COMPLETED_PATTERN.matcher(text);
+					isAnyDeviceCompletedLine = deviceMatch.matches();
+					if (isAnyDeviceCompletedLine) completedDevice = deviceCompletedBy(deviceMatch.group(1));
 				}
 				// Real bug found (per user report — "It should trigger even if its not the user of the mod
 				// completing the device, it should trigger anyway cause sometimes the early enter 2 person
@@ -437,7 +487,44 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 				// {@link #sectionFor}'s mapping of this item's own configured device to the terminal room's
 				// CURRENTLY active section instead — the real, unambiguous signal for which device this
 				// generic line can possibly be about, independent of who actually completed it.
-				if (isAnyDeviceCompletedLine && DungeonState.getTerminalSection() == sectionFor(item.deviceKind)) {
+				//
+				// Real bug found (per user report — "The boss guide detecting the device complete chat message
+				// is detecting terminal completions aswell" — the actual observed symptom, confirmed via
+				// follow-up, was the DEVICE_FINISHED step getting silently skipped/jumped-past the moment a
+				// LATER step's own terminal/lever activation advanced currentStep instead): this used to require
+				// an EXACT match against the section CURRENTLY active. DungeonState's own terminalSection
+				// advances the instant ANY of that section's terminal/lever/device progress lines reaches
+				// current==total (see GOLDOR_PROGRESS_PATTERN's own doc comment — by design, since ANY of the
+				// three can be the last thing needed to finish a section) — but Hypixel doesn't guarantee the
+				// device's own distinct "completed a device!" broadcast arrives BEFORE that last progress tick.
+				// If it arrives just after, the section has already moved on one step by the time this line
+				// shows up, so the exact-match check above could never be satisfied — the step then sat stuck
+				// forever until some unrelated LATER step's own real signal fired and dragged currentStep past
+				// it, which is exactly the "detecting terminal completions" symptom being reported (a terminal
+				// completing elsewhere is what finally moved the guide, not the device itself). Also accepts the
+				// device's mapped section being exactly ONE section behind the current one — a trailing
+				// completion line for the section that JUST finished — without loosening the check enough to
+				// match a section two or more behind (a genuinely stale/unrelated line).
+				DungeonState.TerminalSection deviceSection = sectionFor(item.deviceKind);
+				DungeonState.TerminalSection currentSection = DungeonState.getTerminalSection();
+				boolean sectionMatches;
+				if (completedDevice != null && sectionMatches(completedDevice, currentSection) && item.stepNumber != currentStep
+					&& sectionFor(completedDevice).ordinal() > currentSection.ordinal()) {
+					// Finished ahead of its section (early enter): don't jump the guide past the steps still in
+					// front of it — remember it, and onTick advances once the guide actually reaches that step.
+					preCompletedDevices.add(completedDevice);
+					return;
+				}
+				if (completedDevice != null) {
+					// Attributed via the EE2 box: the Levers device finished even though S2 isn't active yet.
+					sectionMatches = completedDevice == item.deviceKind && sectionMatches(completedDevice, currentSection);
+				} else {
+					// Chat only (never the lamp grid: every lamp is already lit after predev, which would skip
+					// straight to a Levers step) — same section rule as before when attribution isn't possible.
+					sectionMatches = currentSection == deviceSection
+						|| currentSection.ordinal() == deviceSection.ordinal() + 1;
+				}
+				if (isAnyDeviceCompletedLine && sectionMatches) {
 					currentStep = nextStepAfter(myItems, item.stepNumber);
 					return;
 				}
@@ -468,6 +555,20 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 				// shape as DEVICE_FINISHED's own split: pdMode on skips this chat check entirely (onTick's
 				// lamp-grid read is the only signal), pdMode off is unaffected (chat only, exactly as before).
 				if (item.pdMode) continue;
+				// Real bug found (per user report — "I did a terminal and the boss guide thought i completed a
+				// different terminal... I completed a terminal in the first section and a terminal complete
+				// step triggered in the third section making it jump to that instead. It should wait until the
+				// terminal complete step starts until it starts searching for a completed terminal"):
+				// TERMINAL_ACTIVATED_PATTERN only confirms the LOCAL PLAYER activated SOME real terminal — it
+				// can never say which section, unlike DEVICE_FINISHED's shared line which is at least narrowed
+				// down by sectionFor. With no section check at all here, completing ANY terminal anywhere in the
+				// run satisfied whichever TERMINAL_DONE item this ascending-order loop reached first that was
+				// still stepNumber >= currentStep — often a much LATER section's own terminal step, jumping
+				// straight to it and skipping every real step in between. Unlike DEVICE_FINISHED/LEAP_USED
+				// (which genuinely need to scan ahead for early-enter teammates/self-heal), a terminal step has
+				// no such ambiguity to correct for: the local player is either on this exact step or they
+				// aren't, so this now only ever searches while the guide is actually sitting on this step.
+				if (item.stepNumber != currentStep) continue;
 				if (isLocalTerminalActivated == null) {
 					Minecraft mc = Minecraft.getInstance();
 					Matcher m = TERMINAL_ACTIVATED_PATTERN.matcher(text);
@@ -495,8 +596,12 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 		if (inBoss && !wasInBoss) {
 			currentStep = firstStepFor(resolveActiveClass());
 			justEnteredBoss = true;
+			preCompletedDevices.clear();
 		}
 		wasInBoss = inBoss;
+		// Dragon Dead steps need M7Dragons' death detection even when the Dragons module itself is off.
+		com.cokelord.skyblocksimplified.dungeon.m7.M7Dragons.externalTracking = isEnabled()
+			&& items.stream().anyMatch(i -> i.type == StepType.DRAGON_DEAD);
 		// Real bug found (per user report — "it doesn't seem to be going to the next step when I break
 		// either of the blocks"): this used to gate the WHOLE method on inRealBossFight() (a real, live
 		// Hypixel boss fight only) — but the /bg singleplayer commands added last round exist specifically
@@ -525,6 +630,19 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 		if (justEnteredBoss) {
 			justEnteredBoss = false;
 			return;
+		}
+
+		// A non-PD device step whose device already finished early (onChatMessage's preCompletedDevices):
+		// advance past it as soon as the guide is actually on it.
+		if (!preCompletedDevices.isEmpty()) {
+			for (CopilotItem item : myItems) {
+				if (item.stepNumber != currentStep || item.type != StepType.DEVICE_FINISHED) continue;
+				if (item.pdMode && (item.deviceKind == DeviceKind.ALIGN || item.deviceKind == DeviceKind.LEVERS)) continue;
+				if (preCompletedDevices.remove(item.deviceKind)) {
+					currentStep = nextStepAfter(myItems, item.stepNumber);
+					break;
+				}
+			}
 		}
 
 		for (CopilotItem item : myItems) {
@@ -597,6 +715,9 @@ public class DungeonsCopilotFeature extends Feature implements MoveableWidget {
 				case DEVICE_FINISHED -> false; // handled by onChatMessage / the PD Mode loop above, not here
 				case LEAP_USED -> false; // handled by onChatMessage above, not here
 				case TERMINAL_DONE -> false; // handled by onChatMessage above, not here
+				case RELIC_PICKED_UP -> com.cokelord.skyblocksimplified.dungeon.m7.M7Relics.pickedUpThisRun();
+				case RELIC_PLACED -> com.cokelord.skyblocksimplified.dungeon.m7.M7Relics.placedThisRun();
+				case DRAGON_DEAD -> com.cokelord.skyblocksimplified.dungeon.m7.M7Dragons.deathsThisRun() >= dragonDeadOrdinal(myItems, item);
 			};
 			if (done) {
 				currentStep = nextStepAfter(myItems, currentStep);

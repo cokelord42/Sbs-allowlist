@@ -62,18 +62,27 @@ public class MageBeamFeature extends Feature {
 			this.removeAtTick = removeAtTick;
 		}
 
-		void updateEndpoints(Vec3 playerPos) {
+		/** Per user report ("They dont seem to stay visible when i move my camera... Very glitchy"): the ends
+		 *  used to be the points closest to/furthest from the PLAYER, re-picked every tick out of a scattered
+		 *  particle spray — moving or turning swapped which stray particles won, so the line jumped around or
+		 *  collapsed. Now the extremes along the beam's own direction (first particle -> newest particle), so
+		 *  they only change when the beam itself receives particles. */
+		void recomputeEndpoints() {
 			if (points.isEmpty()) return;
-			Vec3 closest = points.get(0), furthest = points.get(0);
-			double minSqr = closest.distanceToSqr(playerPos), maxSqr = minSqr;
-			for (int i = 1; i < points.size(); i++) {
-				Vec3 p = points.get(i);
-				double d = p.distanceToSqr(playerPos);
-				if (d < minSqr) { minSqr = d; closest = p; }
-				if (d > maxSqr) { maxSqr = d; furthest = p; }
+			Vec3 origin = points.get(0);
+			Vec3 dir = points.get(points.size() - 1).subtract(origin);
+			if (dir.lengthSqr() < 1.0e-6) { closestPoint = origin; furthestPoint = origin; return; }
+			dir = dir.normalize();
+			Vec3 min = origin, max = origin;
+			double minT = 0, maxT = 0;
+			for (Vec3 p : points) {
+				double t = p.subtract(origin).dot(dir);
+				if (t < minT) { minT = t; min = p; }
+				if (t > maxT) { maxT = t; max = p; }
 			}
-			closestPoint = closest;
-			furthestPoint = furthest;
+			// Snap both ends onto the fitted axis so sideways particle spread doesn't tilt the line.
+			closestPoint = origin.add(dir.scale(minT));
+			furthestPoint = origin.add(dir.scale(maxT));
 		}
 	}
 
@@ -128,8 +137,6 @@ public class MageBeamFeature extends Feature {
 			ClientTickEvents.END_CLIENT_TICK.register(client -> {
 				if (instance == null || !instance.isEnabled() || !DungeonState.isInDungeon() || client.player == null) return;
 				instance.currentTick++;
-				Vec3 playerPos = client.player.position();
-				for (Beam beam : instance.activeBeams) beam.updateEndpoints(playerPos);
 				instance.activeBeams.removeIf(b -> instance.currentTick >= b.removeAtTick);
 			});
 
@@ -181,11 +188,15 @@ public class MageBeamFeature extends Feature {
 			}
 		}
 		if (best != null) {
-			if (best.points.size() >= MAX_POINTS_PER_BEAM) best.points.remove(0);
+			// Drop from the middle, never the first particle — it anchors the beam's start and direction.
+			if (best.points.size() >= MAX_POINTS_PER_BEAM) best.points.remove(1);
 			best.points.add(point);
 			best.lastUpdateTick = currentTick;
+			best.recomputeEndpoints();
 		} else {
-			activeBeams.add(new Beam(point, currentTick, currentTick + durationTicks));
+			Beam beam = new Beam(point, currentTick, currentTick + durationTicks);
+			beam.recomputeEndpoints();
+			activeBeams.add(beam);
 			while (activeBeams.size() > MAX_ACTIVE_BEAMS) activeBeams.remove(0);
 		}
 	}

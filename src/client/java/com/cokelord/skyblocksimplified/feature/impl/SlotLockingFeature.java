@@ -159,12 +159,38 @@ public class SlotLockingFeature extends Feature {
 		return isDropAbility && !onCooldown;
 	}
 
+	// Per user request ("The currently held item should unlock/be able to be dropped in dungeons when ult is
+	// ready but only once so you can ultimate while holding it. Same with when the other class ability is
+	// ready"): Hypixel's own ready lines each grant ONE drop of a locked held item (the drop key is what
+	// triggers the ability), consumed by the next locked drop. Cleared on leaving the dungeon.
+	private static final String ULTIMATE_READY_SUFFIX = "is ready to use! Press DROP to activate it!";
+	private static final String ABILITY_AVAILABLE_SUFFIX = "is now available!";
+	private static boolean ultDropReady = false;
+	private static boolean abilityDropReady = false;
+
+	/** Consumes one ult/class-ability drop allowance if there is one (see the fields above). */
+	public static boolean consumeAbilityDrop() {
+		if (!com.cokelord.skyblocksimplified.dungeon.DungeonState.isInDungeon()) { ultDropReady = abilityDropReady = false; return false; }
+		if (ultDropReady) { ultDropReady = false; return true; }
+		if (abilityDropReady) { abilityDropReady = false; return true; }
+		return false;
+	}
+
 	private static boolean listenersRegistered = false;
 
 	@Override
 	protected void onEnable() {
 		if (!listenersRegistered) {
 			listenersRegistered = true;
+			// ALLOW_GAME (always true): Chat De-clutter / Dungeon De-clutter can hide these very lines, and hidden
+			// lines never reach GAME listeners.
+			net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+				if (overlay || !com.cokelord.skyblocksimplified.dungeon.DungeonState.isInDungeon()) return true;
+				String text = message.getString().strip();
+				if (text.endsWith(ULTIMATE_READY_SUFFIX)) ultDropReady = true;
+				else if (text.endsWith(ABILITY_AVAILABLE_SUFFIX)) abilityDropReady = true;
+				return true;
+			});
 			ContainerClickRegistry.setRule("slot_locking", this::onSlotClick);
 			// Per user request ("Remove the outline from the locked items") — the lock-icon badge on
 			// PreTooltipRenderRegistry (see renderLockIcon's own doc comment) is the only visible indicator now.
@@ -259,9 +285,15 @@ public class SlotLockingFeature extends Feature {
 			// locked... it just binds slots and not actually items"): this no longer restricts movement at
 			// all, only dropping — the message now says exactly that instead of the old, now-inaccurate
 			// "or moved out of your inventory" claim.
-			client.gui.hud.getChat().addClientSystemMessage(Component.literal(nowLocked
-				? "§aItem locked. It can't be dropped until unlocked."
-				: "§cItem unlocked."));
+			//
+			// Per a later user request ("Change the 'Item locked...' chat notification into a notification
+			// toast"): moved off the chat log entirely onto the shared toast queue every other one-off mod
+			// confirmation (Export/Import Successful, Update available) already uses. Per a further request
+			// ("Remove the item unlocked notification"): unlocking is silent now (still gets its own lower-
+			// pitched sound above) — only locking shows a toast.
+			if (nowLocked) {
+				com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Item Locked", "It can't be dropped until unlocked.");
+			}
 		}
 	}
 

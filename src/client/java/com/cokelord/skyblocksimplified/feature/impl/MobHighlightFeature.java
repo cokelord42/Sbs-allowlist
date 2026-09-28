@@ -100,6 +100,127 @@ public class MobHighlightFeature extends Feature {
 	public static boolean isHighFrequencyPolling() { return highFrequencyPolling; }
 	public static void setHighFrequencyPolling(boolean value) { highFrequencyPolling = value; }
 
+	// Per user report ("The highlight highlights everyone elses bosses. Make it search for the nametag that
+	// says 'Spawned by: {username}' and make sure it matches the users username. Add an option inside of the
+	// highlight module however to disable this incase people are boss trading."): only meaningful for a
+	// slayer-tagged highlight (slayerType != null) — Zealots/Arachne/pests etc. have no per-player-owned
+	// instance concept at all. Defaults to true (only highlight your own boss) per the user's own framing of
+	// this as the expected behavior, with boss trading as the opt-out case. See isSpawnedByLocalPlayer's own
+	// doc comment for the caveat that the exact "Spawned by:" nametag structure is unverified against a live
+	// client — this is a best-effort implementation to be corrected by the user's own testing.
+	private boolean requireOwnBoss = true;
+
+	public boolean isRequireOwnBoss() { return requireOwnBoss; }
+	public void setRequireOwnBoss(boolean requireOwnBoss) { this.requireOwnBoss = requireOwnBoss; }
+
+	// Per user request ("Add a new 'hide other's bosses' in the slayer boss highlights. It should hide other
+	// bosses that doesnt match the Spawned by: nametag"): a stronger, separate option from requireOwnBoss
+	// above — that one only withholds the HIGHLIGHT outline from someone else's boss (it still renders as a
+	// normal, un-highlighted mob); this makes it not render at all, via the same EntityHideRegistry every
+	// other "hide this entity" feature in this project already uses. Independent toggle, only meaningful (and
+	// only shown in the GUI) for a slayerType-tagged instance, same gating as requireOwnBoss.
+	private boolean hideOthersBosses = false;
+
+	public boolean isHideOthersBosses() { return hideOthersBosses; }
+	public void setHideOthersBosses(boolean hideOthersBosses) { this.hideOthersBosses = hideOthersBosses; }
+
+	/** {@link com.cokelord.skyblocksimplified.highlight.EntityHideRegistry} rule backing
+	 *  {@link #hideOthersBosses} — true for the actual named boss entity (see {@link #resolveNamedBossEntity})
+	 *  when it fails the same "Spawned by:" ownership check {@link #requireOwnBoss} uses, OR (see
+	 *  {@link #isDecorationNearOtherPlayersBoss}) an unrelated nearby entity that's really part of the same
+	 *  boss "package" — a second/third real mob model with no name of its own, or a small decorative
+	 *  ArmorStand (a phase timer, the "Spawned by:" tag itself). Reads {@link #hideOthersBosses} live rather
+	 *  than only being registered while it's on, so toggling it doesn't need any re-registration. */
+	private boolean isOtherPlayersBoss(Entity entity) {
+		if (slayerType == null || !hideOthersBosses || nameMatcher == null) return false;
+		Entity namedBoss = resolveNamedBossEntity(entity);
+		if (namedBoss != null) return !isSpawnedByLocalPlayer(namedBoss);
+		return isDecorationNearOtherPlayersBoss(entity);
+	}
+
+	/** Null if {@code entity} doesn't carry this boss's real name at all — checked directly on the entity
+	 *  itself, and (for any slayer boss that DOES turn out to use a real vehicle/passenger mount, unlike the
+	 *  confirmed-unrelated-entities shape Tarantula Broodfather turned out to have — see
+	 *  {@link #isDecorationNearOtherPlayersBoss}'s own doc comment) on its passengers too, as a harmless
+	 *  fallback. {@link #isSpawnedByLocalPlayer} only ever needs whichever entity actually has the name, since
+	 *  it already does its own nearby-entity scan for a separate "Spawned by:" tag regardless of which one
+	 *  it's called with. */
+	private Entity resolveNamedBossEntity(Entity entity) {
+		if (nameMatcher.test(entity.getName().getString())) return entity;
+		for (Entity passenger : entity.getPassengers()) {
+			if (nameMatcher.test(passenger.getName().getString())) return passenger;
+		}
+		return null;
+	}
+
+	/** Real bug found (per user's own live debug capture — a "Dump Nearby Entities" tool — showing the
+	 *  Tarantula Broodfather's real structure): NOT a vehicle/passenger stack at all, as two earlier rounds
+	 *  assumed. It's three entirely separate, unrelated entities standing near each other: a plain
+	 *  {@code minecraft:spider} with no custom name, a plain {@code minecraft:cave_spider} with no custom
+	 *  name (per the user: "The first two make up the spider"), and a {@code minecraft:armor_stand} carrying
+	 *  the real name/health ("☠ Tarantula Broodfather V 4.3M❤") — the ONLY one of the three
+	 *  {@link #nameMatcher} ever matches. Per user ("just need it to hide others bosses... hide spiders
+	 *  without a nametag... the bottom spider has no nametag. However, when the conjoined brood phase kicks
+	 *  in, the bottom spider is upside down and has a 'Dinnerbone' nametag"): once the ArmorStand identifies
+	 *  a boss that isn't ours, this hides both real spider entities near it (unnamed, or literally named
+	 *  "Dinnerbone"/"Grumm" — vanilla's own upside-down-render special case, per the Conjoined Brood phase),
+	 *  plus any OTHER small decorative ArmorStand nearby (a phase timer, the "Spawned by:" tag itself — same
+	 *  "invisible ArmorStand carrying just a name" shape every other Hypixel nametag-decoration in this
+	 *  project already uses). Never a real player, regardless of name. */
+	private boolean isDecorationNearOtherPlayersBoss(Entity candidate) {
+		if (candidate instanceof net.minecraft.world.entity.player.Player) return false;
+		boolean isNametagArmorStand = candidate instanceof net.minecraft.world.entity.decoration.ArmorStand;
+		if (!isNametagArmorStand && hasRealCustomName(candidate)) return false;
+		Minecraft mc = Minecraft.getInstance();
+		if (mc.level == null) return false;
+		for (Entity nearby : mc.level.getEntities(candidate, candidate.getBoundingBox().inflate(6.0))) {
+			Entity namedBoss = resolveNamedBossEntity(nearby);
+			if (namedBoss != null && !isSpawnedByLocalPlayer(namedBoss)) return true;
+		}
+		return false;
+	}
+
+	/** False for a genuinely unnamed entity, or one named exactly "Dinnerbone"/"Grumm" — vanilla's own
+	 *  special-case names that flip a mob's render upside-down, which is exactly the shape the Tarantula
+	 *  Broodfather's real spider body takes during its Conjoined Brood phase (per user report). Anything
+	 *  else with a real custom name is left alone here — it isn't one of the two boss models. */
+	private static boolean hasRealCustomName(Entity entity) {
+		if (!entity.hasCustomName()) return false;
+		String name = entity.getCustomName().getString();
+		return !(name.isBlank() || name.equalsIgnoreCase("Dinnerbone") || name.equalsIgnoreCase("Grumm"));
+	}
+
+	/** Best-effort ownership check: scans entities near {@code bossEntity} for a nametag containing
+	 *  "Spawned by: " and compares whatever follows it against the local player's own username. Unverified
+	 *  against a live client (no way to confirm here whether Hypixel puts this on a separate nearby entity —
+	 *  the assumption below — or embeds it as an extra line in the boss's own multi-line name instead), so
+	 *  this checks both: the boss entity's own name first, then every other named entity within 6 blocks.
+	 *  Returns true (don't filter) whenever no "Spawned by:" tag is found at all, so a wrong assumption about
+	 *  where Hypixel puts it fails safe (still highlights) rather than silently hiding every boss. */
+	protected static boolean isSpawnedByLocalPlayer(Entity bossEntity) {
+		Minecraft mc = Minecraft.getInstance();
+		if (mc.player == null || mc.level == null) return true;
+		String myName = mc.player.getName().getString();
+		String ownName = bossEntity.hasCustomName() ? bossEntity.getCustomName().getString() : null;
+		String spawnedBy = extractSpawnedBy(ownName);
+		if (spawnedBy != null) return spawnedBy.equalsIgnoreCase(myName);
+		for (Entity nearby : mc.level.getEntities(bossEntity, bossEntity.getBoundingBox().inflate(6.0))) {
+			if (!nearby.hasCustomName()) continue;
+			spawnedBy = extractSpawnedBy(nearby.getCustomName().getString());
+			if (spawnedBy != null) return spawnedBy.equalsIgnoreCase(myName);
+		}
+		return true;
+	}
+
+	private static final String SPAWNED_BY_MARKER = "Spawned by:";
+
+	private static String extractSpawnedBy(String text) {
+		if (text == null) return null;
+		int idx = text.indexOf(SPAWNED_BY_MARKER);
+		if (idx < 0) return null;
+		return text.substring(idx + SPAWNED_BY_MARKER.length()).strip();
+	}
+
 	public MobHighlightFeature(String id, String displayName, FeatureCategory category, String subcategory,
 								Predicate<String> nameMatcher, int defaultColor) {
 		this(id, displayName, category, subcategory, null, nameMatcher, defaultColor);
@@ -133,30 +254,56 @@ public class MobHighlightFeature extends Feature {
 
 	protected boolean matches(Entity entity) {
 		String name = entity.getName().getString();
-		if (!nameMatcher.test(name)) return false;
-		// Two earlier revisions of this method tried to exclude Hypixel's purely decorative nametag holders
-		// (portal signs, area labels — e.g. the "Zealot Bruiser" End portal sign, which matched the Zealot
-		// rule purely because its own display text contains "Zealot") by ENTITY TYPE — first blanket-
-		// excluding every ArmorStand, then narrowing to just marker stands. Both broke real mob matching
-		// outright, since Hypixel apparently rigs real mobs (pests confirmed) onto armor stands in ways that
-		// don't reliably fall outside either exclusion. Per user's own diagnosis: every real Hypixel mob's
-		// nametag shows a health readout (a number), which a purely decorative sign never has — scoped to
-		// ONLY armor stands, since that's the sole entity type this project has ever seen used both ways
-		// (real mob rig vs. pure decoration); a real player (Highlight Party Members) or any other real mob
-		// entity is never ambiguous with a decorative sign in the first place and needs no extra check.
-		if (entity instanceof net.minecraft.world.entity.decoration.ArmorStand) {
-			for (int i = 0; i < name.length(); i++) {
-				if (Character.isDigit(name.charAt(i))) return true;
+		if (nameMatcher.test(name)) {
+			// Two earlier revisions of this method tried to exclude Hypixel's purely decorative nametag holders
+			// (portal signs, area labels — e.g. the "Zealot Bruiser" End portal sign, which matched the Zealot
+			// rule purely because its own display text contains "Zealot") by ENTITY TYPE — first blanket-
+			// excluding every ArmorStand, then narrowing to just marker stands. Both broke real mob matching
+			// outright, since Hypixel apparently rigs real mobs (pests confirmed) onto armor stands in ways that
+			// don't reliably fall outside either exclusion. Per user's own diagnosis: every real Hypixel mob's
+			// nametag shows a health readout (a number), which a purely decorative sign never has — scoped to
+			// ONLY armor stands, since that's the sole entity type this project has ever seen used both ways
+			// (real mob rig vs. pure decoration); a real player (Highlight Party Members) or any other real mob
+			// entity is never ambiguous with a decorative sign in the first place and needs no extra check.
+			boolean baseMatch;
+			if (entity instanceof net.minecraft.world.entity.decoration.ArmorStand) {
+				baseMatch = false;
+				for (int i = 0; i < name.length(); i++) {
+					if (Character.isDigit(name.charAt(i))) { baseMatch = true; break; }
+				}
+			} else {
+				// Per user report (Tarantula Broodfather: "the tarantula boss is two spiders. One small riding
+				// on one bigger spider"), this used to skip highlighting the entity directly whenever it was
+				// itself a passenger (entity.getVehicle() == null), relying on the vehicle's own matches() call
+				// below to pick up the visible body instead. Per a later user correction ("It always highlights
+				// the top spider. Make it highlight both as one big box instead") that never actually worked as
+				// hoped — whichever of the two Hypixel treats as the real rendered model, excluding ONE of them
+				// only ever produced a single-entity box around the other, not a combined box covering the real
+				// visible stack either way. Both now match unconditionally (HighlightBoxRenderer's own
+				// unionWithMountedEntities unions a matched entity's box with its vehicle's/passengers' boxes),
+				// so the actual on-screen box always covers the full stack regardless of which one is "really"
+				// the model.
+				baseMatch = true;
 			}
-			return false;
+			if (!baseMatch) return false;
+			if (slayerType != null && requireOwnBoss && !isSpawnedByLocalPlayer(entity)) return false;
+			return true;
 		}
-		return true;
+		// This entity's own name doesn't match — highlight it anyway if one of ITS passengers does (see above).
+		for (Entity passenger : entity.getPassengers()) {
+			if (nameMatcher.test(passenger.getName().getString())) {
+				if (slayerType != null && requireOwnBoss && !isSpawnedByLocalPlayer(entity)) return false;
+				return true;
+			}
+		}
+		return false;
 	}
 
 	@Override
 	protected void onEnable() {
 		if (!registered) {
 			MobHighlightRegistry.setRule(getId(), this::matches, color, this);
+			com.cokelord.skyblocksimplified.highlight.EntityHideRegistry.setRule(getId() + "_hide_others_bosses", this::isOtherPlayersBoss);
 			registered = true;
 		}
 	}
@@ -165,6 +312,7 @@ public class MobHighlightFeature extends Feature {
 	protected void onDisable() {
 		if (registered) {
 			MobHighlightRegistry.clearRule(getId());
+			com.cokelord.skyblocksimplified.highlight.EntityHideRegistry.clearRule(getId() + "_hide_others_bosses");
 			registered = false;
 		}
 	}
@@ -393,6 +541,10 @@ public class MobHighlightFeature extends Feature {
 		// Saved redundantly in every highlight module's own config blob — harmless (they're all the exact
 		// same shared static value, saved/loaded identically regardless of which module's turn it is).
 		obj.addProperty("highFrequencyPolling", highFrequencyPolling);
+		if (slayerType != null) {
+			obj.addProperty("requireOwnBoss", requireOwnBoss);
+			obj.addProperty("hideOthersBosses", hideOthersBosses);
+		}
 		return obj;
 	}
 
@@ -425,6 +577,8 @@ public class MobHighlightFeature extends Feature {
 		// ever read it back — every restart silently fell through to the field's own default (true/occluded)
 		// no matter what was saved.
 		if (obj.has("occlusion3D")) occlusion3D = obj.get("occlusion3D").getAsBoolean();
+		if (obj.has("requireOwnBoss")) requireOwnBoss = obj.get("requireOwnBoss").getAsBoolean();
+		if (obj.has("hideOthersBosses")) hideOthersBosses = obj.get("hideOthersBosses").getAsBoolean();
 	}
 
 	@Override

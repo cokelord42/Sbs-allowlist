@@ -16,10 +16,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * expands them into individual jittered ClientLevel.doAddParticle calls — burrow-detection needs those
  * exact packet-level values (see ParticlePacketEvent's doc comment), not the post-expansion per-particle
  * ones ClientLevelParticleMixin sees.
+ *
+ * <p>Injected right after {@code ensureRunningOnSameThread}, not at HEAD: that call throws on the netty
+ * thread and re-queues the packet onto the client thread, so a HEAD hook ran every observer twice per packet
+ * (once off-thread, racing the main thread). After it, observers run exactly once, on the client thread.
  */
 @Mixin(ClientPacketListener.class)
 public class ParticleEventPacketMixin {
-	@Inject(method = "handleParticleEvent", at = @At("HEAD"))
+	@Inject(method = "handleParticleEvent", at = @At(value = "INVOKE", target = "Lnet/minecraft/network/protocol/PacketUtils;ensureRunningOnSameThread(Lnet/minecraft/network/protocol/Packet;Lnet/minecraft/network/PacketListener;Lnet/minecraft/network/PacketProcessor;)V", shift = At.Shift.AFTER))
 	private void skyblocksimplified$observeParticlePacket(ClientboundLevelParticlesPacket packet, CallbackInfo ci) {
 		ParticlePacketObserverRegistry.notifyReceived(new ParticlePacketEvent(
 			packet.getParticle(),

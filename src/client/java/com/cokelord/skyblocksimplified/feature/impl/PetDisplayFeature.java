@@ -1,6 +1,7 @@
 package com.cokelord.skyblocksimplified.feature.impl;
 
 import com.cokelord.skyblocksimplified.SkyblockSimplified;
+import com.cokelord.skyblocksimplified.config.ConfigManager;
 import com.cokelord.skyblocksimplified.feature.Feature;
 import com.cokelord.skyblocksimplified.feature.FeatureCategory;
 import com.cokelord.skyblocksimplified.hud.HudPosition;
@@ -12,7 +13,6 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
-import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -117,14 +117,12 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 	private static final Pattern PETS_MENU_TITLE = Pattern.compile("^(?:\\(\\d+/\\d+\\) )?Pets$");
 	private static final Pattern PETS_MENU_NAME = Pattern.compile("^(?:⭐ )?\\[Lvl (\\d+)](?: \\[\\d+✦])? ([A-Za-z ]+?)(?: ✦)?$");
 
-	// See the HudElementRegistry render callback's own doc comment for why this is tracked manually via
-	// ScreenEvents rather than a `mc.screen == null` check.
-	private static volatile boolean blockingScreenOpen = false;
-
 	private String currentPetName = null;
 	private Integer currentPetLevel = null;
 	private int currentPetColor = 0xFFFFFFFF;
-	private ItemStack petIcon = ItemStack.EMPTY;
+	// Built lazily from currentPetSkin by icon(), never eagerly — see icon()'s own doc comment for the real
+	// startup failure eager construction caused. null = not built yet for the current skin.
+	private ItemStack petIcon = null;
 	// Real bug found (per user report — "the pet caching is simple. When i swap to a pet, and it displays
 	// that icon, it should cache that icon aswell. Swapping to another pet then should overwrite that cache
 	// and create a new cache"): restoring the icon on launch used to depend entirely on looking
@@ -194,26 +192,17 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 		// channel Autopet's own line actually uses, this checks the action-bar channel too, independently of
 		// the chat-only listener above — harmless if Autopet's line turns out to only ever use one or the
 		// other.
-		ClientReceiveMessageEvents.GAME.register((message, overlay) -> {
-			if (instance == null || !overlay) return;
+		// ALLOW_GAME (always true), not GAME: Chat De-clutter's Autopet hider cancels this line, and cancelled
+		// lines never reach GAME listeners.
+		ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+			if (instance == null || !overlay) return true;
 			try {
 				instance.onAutopetActionBar(message);
 			} catch (Exception e) {
 				SkyblockSimplified.LOGGER.error("Pet Display action-bar listener threw, skipping this line", e);
 			}
+			return true;
 		});
-		// Real bug found (per user report — "the pet display is still rendering above guis, and it shows up in
-		// the storage overlay for example which makes it a little annoying"): Fabric's HudElementRegistry layers
-		// fire every frame regardless of whether a real Screen is open — unlike vanilla's own HUD, nothing here
-		// was gating on screen state at all, so this painted straight over any open GUI, Storage Overlay
-		// included (whose own panel is drawn from a separate ScreenEvents render hook, not this one, so it
-		// never got a say in the ordering). This MC version's own Minecraft class no longer exposes a public
-		// `screen` field/getter at all (confirmed by decompiling the real mapped client jar — every method that
-		// used to expose it, like setScreen, is now paired with no visible getter), so screen-open state is
-		// tracked locally the same way every other feature in this codebase already does it — via
-		// ScreenEvents.AFTER_INIT/remove — rather than reaching for a field that doesn't exist here. Hidden
-		// behind any real screen the same way the vanilla HUD itself is, except ChatScreen — typing in chat
-		// should still show it, matching vanilla's own "hotbar/health stay visible while chat is open" behavior.
 		// Per user report ("The loadout detecting does work but needs to be faster. If i insta close the
 		// loadouts menu when i have selected the loadout it doesnt change the displayed pet"): checkLoadoutSelection
 		// (called from onTick, a real game tick — up to 50ms) can only ever see a loadout as "currently
@@ -233,16 +222,14 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 				}
 			}
 		});
-		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
-			boolean isChat = screen instanceof net.minecraft.client.gui.screens.ChatScreen;
-			if (!isChat) blockingScreenOpen = true;
-			ScreenEvents.remove(screen).register(s -> {
-				if (!isChat) blockingScreenOpen = false;
-			});
-		});
 		HudElementRegistry.attachElementBefore(net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements.PLAYER_LIST, Identifier.fromNamespaceAndPath(SkyblockSimplified.MOD_ID, "pet_display"), (graphics, tracker) -> {
 			if (instance == null || !instance.isVisible()) return;
-			if (blockingScreenOpen) return;
+			// Hidden behind any open screen except chat, like the vanilla HUD. Read live every frame: this used
+			// to be a flag flipped by ScreenEvents.AFTER_INIT/remove, which got stuck "open" whenever a screen
+			// was replaced without its remove event firing (e.g. the connect/loading screens on the initial
+			// join) — the widget then stayed hidden until the next world switch cycled a screen properly.
+			var screen = Minecraft.getInstance().gui.screen();
+			if (screen != null && !(screen instanceof net.minecraft.client.gui.screens.ChatScreen)) return;
 			Minecraft mc = Minecraft.getInstance();
 			int x = Math.round(instance.position.anchorX * mc.getWindow().getGuiScaledWidth());
 			int y = Math.round(instance.position.anchorY * mc.getWindow().getGuiScaledHeight());
@@ -251,7 +238,7 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 	}
 
 	private void onChatMessage(Component message) {
-		String text = message.getString();
+		String text = stripLegacyCodes(message.getString());
 		Matcher summon = SUMMON_PATTERN.matcher(text);
 		if (summon.matches()) {
 			setCurrentPet(summon.group(1), null, colorForSubstring(message, summon.group(1)));
@@ -261,31 +248,65 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 		if (despawn.matches()) {
 			currentPetName = null;
 			currentPetLevel = null;
-			petIcon = ItemStack.EMPTY;
-			currentPetSkin = null;
+			setSkin(null);
+			ConfigManager.save();
 			return;
 		}
-		Matcher autopet = PET_EQUIP_PATTERN.matcher(text);
-		if (autopet.find()) {
-			int level = Integer.parseInt(autopet.group(1));
-			setCurrentPet(autopet.group(2), level, colorForSubstring(message, autopet.group(2)));
-			return;
-		}
+		if (tryEquipLine(message, text)) return;
 		Matcher levelUp = LEVEL_UP_PATTERN.matcher(text);
 		if (levelUp.matches() && currentPetName != null) {
 			currentPetLevel = Integer.parseInt(levelUp.group(1));
+			ConfigManager.save();
 		}
 	}
 
 	/** See the action-bar listener's own registration doc comment for why this exists as a separate path
 	 *  from {@link #onChatMessage}. */
 	private void onAutopetActionBar(Component message) {
-		String text = message.getString();
-		Matcher autopet = PET_EQUIP_PATTERN.matcher(text);
-		if (autopet.find()) {
-			int level = Integer.parseInt(autopet.group(1));
-			setCurrentPet(autopet.group(2), level, colorForSubstring(message, autopet.group(2)));
+		tryEquipLine(message, stripLegacyCodes(message.getString()));
+	}
+
+	private boolean tryEquipLine(Component message, String strippedText) {
+		Matcher m = PET_EQUIP_PATTERN.matcher(strippedText);
+		if (!m.find()) return false;
+		setCurrentPet(m.group(2), Integer.parseInt(m.group(1)), colorForSubstring(message, m.group(2)));
+		return true;
+	}
+
+	// Real bug found (per user's own real captured raw line: "§cAutopet §eequipped your §7[Lvl 100] §6Black
+	// Cat§4 ✦§e! §a§lVIEW RULE"): Hypixel sometimes sends this exact message as ONE plain-text run with
+	// literal "§" legacy codes baked directly into the string content, not as real per-run Style objects —
+	// Component#getString() returns those "§" bytes completely unprocessed in that case, since there's no
+	// real Style boundary for it to strip. That breaks PET_EQUIP_PATTERN's own "\D*?" ("non-digit") gaps
+	// between fixed keywords the moment a NUMERIC color code (e.g. "§7", "§6", "§4" — half the legacy codes
+	// are digits) lands inside one of those gaps, since \D by definition can't cross a digit — the whole
+	// match silently failed on exactly this kind of line. Stripping every "§x" pair before matching removes
+	// the gap entirely instead of trying to make the gap pattern tolerate it.
+	private static final Pattern LEGACY_CODE = Pattern.compile("(?i)§[0-9a-fk-or]");
+
+	private static String stripLegacyCodes(String text) {
+		return text.indexOf('§') < 0 ? text : LEGACY_CODE.matcher(text).replaceAll("");
+	}
+
+	// Same values MsdfFont's own FORMATTING_COLORS table uses — the standard vanilla legacy 0-9/a-f palette.
+	private static final int[] LEGACY_COLOR_RGB = {
+		0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xFFAA00, 0xAAAAAA,
+		0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+	};
+
+	/** Fallback for {@link #colorForSubstring} used only when the real-Style walk finds nothing — exactly the
+	 *  raw-literal-"§"-codes case {@link #stripLegacyCodes} exists for, where there's no real Style to find at
+	 *  all. Scans backward from the name's position in the RAW (unstripped) text for the nearest "§x" and maps
+	 *  it through the same legacy palette every other renderer in this codebase already uses. */
+	private static Integer legacyColorBefore(String rawText, String needle) {
+		int idx = rawText.indexOf(needle);
+		if (idx < 1) return null;
+		for (int i = idx - 2; i >= 0; i--) {
+			if (rawText.charAt(i) != '§') continue;
+			int value = Character.digit(Character.toLowerCase(rawText.charAt(i + 1)), 16);
+			return value >= 0 && value < LEGACY_COLOR_RGB.length ? (0xFF000000 | LEGACY_COLOR_RGB[value]) : null;
 		}
+		return null;
 	}
 
 	/** Real, confirmed-shape detection for a Loadout swap's pet — see PET_LOADOUT_PATTERN's own doc comment
@@ -303,17 +324,20 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 			if (loadoutSlot >= allSlots.size()) continue;
 			ItemStack stack = allSlots.get(loadoutSlot).getItem();
 			if (!CustomLoadoutKeybindsFeature.isCurrentlySelectedLoadout(stack)) continue;
-			ItemLore lore = stack.get(DataComponents.LORE);
-			if (lore == null) return;
-			for (Component line : lore.lines()) {
-				Matcher m = PET_LOADOUT_PATTERN.matcher(line.getString());
-				if (m.find()) {
-					int level = Integer.parseInt(m.group(1));
-					setCurrentPet(m.group(2), level, colorForSubstring(line, m.group(2)));
-					return;
-				}
-			}
+			applyLoadoutPet(stack);
 			return;
+		}
+	}
+
+	private void applyLoadoutPet(ItemStack stack) {
+		ItemLore lore = stack.get(DataComponents.LORE);
+		if (lore == null) return;
+		for (Component line : lore.lines()) {
+			Matcher m = PET_LOADOUT_PATTERN.matcher(line.getString());
+			if (m.find()) {
+				setCurrentPet(m.group(2), Integer.parseInt(m.group(1)), colorForSubstring(line, m.group(2)));
+				return;
+			}
 		}
 	}
 
@@ -333,29 +357,44 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 		if (!(Minecraft.getInstance().gui.screen() instanceof AbstractContainerScreen<?> screen)) return;
 		if (!screen.getTitle().getString().toLowerCase(java.util.Locale.ROOT).contains("loadouts")) return;
 
-		ItemStack stack = slot.getItem();
-		ItemLore lore = stack.get(DataComponents.LORE);
-		if (lore == null) return;
-		for (Component line : lore.lines()) {
-			Matcher m = PET_LOADOUT_PATTERN.matcher(line.getString());
-			if (m.find()) {
-				int level = Integer.parseInt(m.group(1));
-				setCurrentPet(m.group(2), level, colorForSubstring(line, m.group(2)));
-				return;
-			}
-		}
+		applyLoadoutPet(slot.getItem());
 	}
 
 	private void setCurrentPet(String name, Integer level, int color) {
-		currentPetName = name.strip();
+		String stripped = name.strip();
+		String skin = skinCacheByName.get(stripped);
+		// A plain "You summoned your X!" line carries no level — keep the one already known for that same pet.
+		if (level == null && stripped.equals(currentPetName)) level = currentPetLevel;
+		// checkLoadoutSelection calls this every tick the Loadouts menu is open — bail on an unchanged pet so
+		// that doesn't re-snapshot every feature's config 20 times a second.
+		if (stripped.equals(currentPetName) && java.util.Objects.equals(level, currentPetLevel)
+			&& color == currentPetColor && java.util.Objects.equals(skin, currentPetSkin)) return;
+		currentPetName = stripped;
 		currentPetLevel = level;
 		currentPetColor = color;
-		String skin = skinCacheByName.get(currentPetName);
-		petIcon = skin != null ? SkullTextureUtil.buildHeadWithTexture(skin) : ItemStack.EMPTY;
 		// See currentPetSkin's own field doc comment — always overwritten to mirror whatever's now actually
-		// displayed (null when no real skin is known yet for this pet), so the next save persists exactly
-		// what's on screen rather than depending on a name lookup succeeding again later.
+		// displayed (null when no real skin is known yet for this pet).
+		setSkin(skin);
+		// Persisted immediately rather than relying on an incidental save elsewhere or the clean-quit flush —
+		// a crash/force-close would otherwise lose this session's pet swaps.
+		ConfigManager.save();
+	}
+
+	private void setSkin(String skin) {
+		if (!java.util.Objects.equals(skin, currentPetSkin)) petIcon = null;
 		currentPetSkin = skin;
+	}
+
+	/** Real root cause of "the icon never survives a restart" (after earlier rounds had already fixed the
+	 *  persistence itself): loadPersistedData runs from ConfigManager.load() at mod-init time, before the
+	 *  data-component registry is bound, so building the skull ItemStack there threw "Components not bound
+	 *  yet" (the exact failure InvincibilityTimerFeature.Type#getIcon documents). ConfigManager's per-feature
+	 *  try/catch swallowed it AFTER name/level/color had already been restored — hence text-only on every
+	 *  launch until the Pets menu was reopened. The stack is now only ever built here, on first render. */
+	private ItemStack icon() {
+		if (currentPetSkin == null) return ItemStack.EMPTY;
+		if (petIcon == null) petIcon = SkullTextureUtil.buildHeadWithTexture(currentPetSkin);
+		return petIcon;
 	}
 
 	/** Hypixel colors the pet name in these chat lines by the pet's actual rarity (common=white,
@@ -371,7 +410,9 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 			}
 			return Optional.<Integer>empty();
 		}, Style.EMPTY).orElse(null);
-		return rgb != null ? (0xFF000000 | rgb) : 0xFFFFFFFF;
+		if (rgb != null) return 0xFF000000 | rgb;
+		Integer legacy = legacyColorBefore(component.getString(), needle);
+		return legacy != null ? legacy : 0xFFFFFFFF;
 	}
 
 	@Override
@@ -400,13 +441,22 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 			if (!nameMatch.matches()) continue;
 			String name = nameMatch.group(2).strip();
 			String skin = SkullTextureUtil.fromItem(stack);
-			if (skin != null) skinCacheByName.put(name, skin);
-			if (!isSelectedInMenu(stack)) continue;
+			// See setCurrentPet's own doc comment on the same missing-save bug: a skin learned here (this is
+			// the ONLY place skinCacheByName ever gets populated) used to never get persisted on its own either
+			// — only saved once, incidentally, whenever setCurrentPet happened to also fire for some other pet.
+			// Only saves when the entry is actually new/changed (Map#put returns the previous value), since this
+			// loop runs every tick the Pets menu is open and re-puts the same unchanged skin every single time.
+			boolean skinChanged = skin != null && !skin.equals(skinCacheByName.put(name, skin));
+			if (!isSelectedInMenu(stack)) {
+				if (skinChanged) ConfigManager.save();
+				continue;
+			}
 			if (name.equals(currentPetName)) {
-				if (petIcon.isEmpty() && skin != null) {
-					petIcon = SkullTextureUtil.buildHeadWithTexture(skin);
-					currentPetSkin = skin;
+				if (skin != null && !skin.equals(currentPetSkin)) {
+					setSkin(skin);
+					skinChanged = true;
 				}
+				if (skinChanged) ConfigManager.save();
 			} else {
 				// The chat line that would normally set this hasn't fired yet this session (the menu was
 				// opened before any summon/despawn/autopet line was ever seen) — the menu's own "Click to
@@ -467,7 +517,8 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 		if (currentPetName == null) return new Size(0, 0);
 		try {
 			Font font = Minecraft.getInstance().font;
-			boolean hasIcon = !petIcon.isEmpty();
+			ItemStack icon = icon();
+			boolean hasIcon = !icon.isEmpty();
 			// Per user request ("Add Pet Display compact mode (icon-only)"): only actually goes icon-only
 			// when there IS a real icon to show — with no cached skin yet (see this class's own doc comment
 			// on why the skull texture isn't always available immediately), showing nothing at all would be
@@ -482,13 +533,13 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 			int height = Math.max(hasIcon ? iconSize : 0, iconOnly ? 0 : font.lineHeight);
 
 			if (Math.abs(scale - 1f) < 0.01f) {
-				drawContent(graphics, font, x, y, textX, levelText, hasIcon, iconOnly, height);
+				drawContent(graphics, font, icon, x, y, textX, levelText, iconOnly, height);
 			} else {
 				graphics.pose().pushMatrix();
 				graphics.pose().translate(x, y);
 				graphics.pose().scale(scale);
 				graphics.pose().translate(-x, -y);
-				drawContent(graphics, font, x, y, textX, levelText, hasIcon, iconOnly, height);
+				drawContent(graphics, font, icon, x, y, textX, levelText, iconOnly, height);
 				graphics.pose().popMatrix();
 			}
 			return new Size(Math.round(width * scale), Math.round(height * scale));
@@ -498,8 +549,8 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 		}
 	}
 
-	private void drawContent(GuiGraphicsExtractor graphics, Font font, int x, int y, int textX, String levelText, boolean hasIcon, boolean iconOnly, int height) {
-		if (hasIcon) graphics.item(petIcon, x, y + ICON_Y_OFFSET);
+	private void drawContent(GuiGraphicsExtractor graphics, Font font, ItemStack icon, int x, int y, int textX, String levelText, boolean iconOnly, int height) {
+		if (!icon.isEmpty()) graphics.item(icon, x, y + ICON_Y_OFFSET);
 		if (iconOnly) return;
 		int textY = y + (height - font.lineHeight) / 2;
 		int nameX = textX;
@@ -578,8 +629,8 @@ public class PetDisplayFeature extends Feature implements MoveableWidget {
 			// See currentPetSkin's own field doc comment: restores directly from the guaranteed-accurate
 			// single slot first (whatever was actually on screen at last save), only falling back to the
 			// by-name map lookup for an older config saved before this field existed.
-			currentPetSkin = obj.has("currentPetSkin") ? obj.get("currentPetSkin").getAsString() : skinCacheByName.get(currentPetName);
-			if (currentPetSkin != null) petIcon = SkullTextureUtil.buildHeadWithTexture(currentPetSkin);
+			// Never build the ItemStack here — see icon()'s doc comment; render builds it lazily.
+			setSkin(obj.has("currentPetSkin") ? obj.get("currentPetSkin").getAsString() : skinCacheByName.get(currentPetName));
 		}
 	}
 

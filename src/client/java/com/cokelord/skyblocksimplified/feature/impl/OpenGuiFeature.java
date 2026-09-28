@@ -54,7 +54,11 @@ public class OpenGuiFeature extends Feature {
 				Screen current = client.gui.screen();
 				if (current instanceof MainScreen mainScreen) {
 					mainScreen.requestClose();
-				} else {
+					// Per user request ("Make sure the user is in a world or on a server. The mod menu is
+					// openable anywhere including loading screens and the main menu"): a world/server check
+					// only matters for OPENING the menu; if the world unloads out from under an already-open
+					// menu (e.g. the player disconnects while it's up), closing it is still fine and desired.
+				} else if (client.level != null) {
 					client.gui.setScreen(new MainScreen());
 				}
 			} catch (Exception e) {

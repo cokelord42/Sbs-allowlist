@@ -448,7 +448,13 @@ public class HudEditScreen extends Screen {
 	// Edit gui locations), so Escape here should return there instead of dropping the player out entirely.
 	@Override
 	public void onClose() {
-		net.minecraft.client.Minecraft.getInstance().gui.setScreen(new MainScreen());
+		net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+		// Per user request (mod menu shouldn't be openable outside a world/server): this screen is normally
+		// only reachable from the mod menu itself, so the world is already loaded -- but if it unloads out
+		// from under this screen (e.g. disconnect while it's open), fall through to vanilla's default close
+		// instead of trying to reopen the mod menu with no world to show it over.
+		if (mc.level != null) mc.gui.setScreen(new MainScreen());
+		else super.onClose();
 	}
 
 	private record Bounds(MoveableWidget widget, int x, int y, int w, int h, int handleX, int handleY, int resetX, int resetY,

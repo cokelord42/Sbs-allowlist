@@ -127,8 +127,16 @@ public final class ConfigManager {
 					SkyblockSimplified.LOGGER.error("Failed to load persisted state for {}, skipping it", feature.getId(), e);
 				}
 			}
+		} catch (com.google.gson.JsonParseException e) {
+			// Used to propagate straight out of mod init. Keep a copy before the next save overwrites it.
+			SkyblockSimplified.LOGGER.error("Config {} is corrupt, backing it up and starting from defaults", pathToRead, e);
+			try {
+				Files.copy(pathToRead, pathToRead.resolveSibling(pathToRead.getFileName() + ".corrupt"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+			} catch (IOException copyError) {
+				SkyblockSimplified.LOGGER.error("Failed to back up corrupt config", copyError);
+			}
 		} catch (IOException e) {
-			SkyblockSimplified.LOGGER.error("Failed to load config from {}", CONFIG_PATH, e);
+			SkyblockSimplified.LOGGER.error("Failed to load config from {}", pathToRead, e);
 		}
 	}
 
@@ -332,8 +340,17 @@ public final class ConfigManager {
 	private static void writeToDisk(Map<String, FeatureState> states) {
 		try {
 			Files.createDirectories(CONFIG_PATH.getParent());
-			try (Writer writer = Files.newBufferedWriter(CONFIG_PATH, StandardCharsets.UTF_8)) {
+			// Written to a temp file then atomically moved over the real one: writing CONFIG_PATH in place
+			// truncates it first, so a crash/force-close mid-write left a half-written file that failed to
+			// parse on the next launch, losing every setting at once.
+			Path tmp = CONFIG_PATH.resolveSibling(CONFIG_PATH.getFileName() + ".tmp");
+			try (Writer writer = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
 				GSON.toJson(states, STATE_MAP_TYPE, writer);
+			}
+			try {
+				Files.move(tmp, CONFIG_PATH, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+			} catch (java.nio.file.AtomicMoveNotSupportedException e) {
+				Files.move(tmp, CONFIG_PATH, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 			}
 		} catch (IOException e) {
 			SkyblockSimplified.LOGGER.error("Failed to save config to {}", CONFIG_PATH, e);

@@ -7,6 +7,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.decoration.ArmorStand;
 
 import java.util.List;
+import java.util.regex.Pattern;
 
 /**
  * Generic "is there a nearby floating-text ArmorStand containing this glyph" indicator — ported from
@@ -24,6 +25,13 @@ import java.util.List;
  * sides are stripped of any "§." runs before comparing so the check matches either form.
  */
 public class NametagGlyphIndicatorFeature extends TabWidgetOverlayFeature {
+	// Real cost found (two instances of this feature run at once — shuriken + twilight — each scanning
+	// every rendered ArmorStand 5x/sec): String.replaceAll(String,String) compiles a fresh Pattern on every
+	// single call, since it only ever takes a regex STRING, never a pre-compiled Pattern (same anti-pattern
+	// already fixed elsewhere in this codebase — see IslandGate/DungeonState's own COLOR_CODE fields).
+	// Cached once here instead — identical output, just not rebuilt from source on every nametag checked.
+	private static final Pattern COLOR_CODE = Pattern.compile("§.");
+
 	private final String glyph;
 	private final String label;
 	private boolean active = false;
@@ -45,7 +53,7 @@ public class NametagGlyphIndicatorFeature extends TabWidgetOverlayFeature {
 		for (Entity entity : client.level.entitiesForRendering()) {
 			if (!(entity instanceof ArmorStand stand)) continue;
 			var customName = stand.getCustomName();
-			if (customName != null && customName.getString().replaceAll("§.", "").contains(glyph)) {
+			if (customName != null && COLOR_CODE.matcher(customName.getString()).replaceAll("").contains(glyph)) {
 				active = true;
 				break;
 			}

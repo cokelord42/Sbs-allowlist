@@ -19,6 +19,7 @@ public enum FeatureCategory {
 	// rows to show would just be dead space, same reasoning as the earlier GUI-subcategory removal above.
 	FORAGING("Foraging", "Foraging", "HOTF"),
 	ENCHANTING("Enchanting"),
+	EVENTS("Events", "Diana"),
 	INVENTORY("Inventory", "Inventory", "Enchantments", "Storage", "Misc"),
 	PERFORMANCE("Performance");
 

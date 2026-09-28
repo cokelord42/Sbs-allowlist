@@ -349,6 +349,17 @@ public final class WorldRenderUtil {
 		graphics.text(mc.font, text, Math.round(p.x() - width / 2f), Math.round(p.y()), color);
 	}
 
+	/** {@link #drawText} without the per-call block raycast occlusion test — for callers drawing many labels
+	 *  at once (Terracotta timers: a Sadan wave can put dozens on screen, and one raycast each per frame
+	 *  lagged the game). Always visible through walls. */
+	public static void drawTextNoOcclusion(GuiGraphicsExtractor graphics, String text, Vec3 pos, int color) {
+		WorldToScreen.ScreenPoint p = WorldToScreen.project(pos);
+		if (p.behindCamera()) return;
+		Minecraft mc = Minecraft.getInstance();
+		int width = mc.font.width(text);
+		graphics.text(mc.font, text, Math.round(p.x() - width / 2f), Math.round(p.y()), color);
+	}
+
 	/** Simplified "beacon": a vertical world-space line from the given position up to a fixed height,
 	 *  plus a distance label at the top — not a real beacon-shader beam (no depth-tested beam geometry
 	 *  available here, see the class doc), but reads the same way at ESP-relevant distances. */

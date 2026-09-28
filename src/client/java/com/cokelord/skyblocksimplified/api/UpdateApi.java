@@ -57,8 +57,8 @@ import java.util.concurrent.TimeUnit;
  * directly, so no single resolution strategy is trusted alone.
  *
  * <p>{@link #consumePendingNotification} backs the once-per-session bottom-right toast (see
- * {@code UpdateToastRenderer}) that fires the moment an update is first found — this class only owns the
- * one-shot latch, not any rendering/sound, to keep this a pure network/state class.
+ * {@code NotificationToastRenderer}) that fires the moment an update is first found — this class only owns
+ * the one-shot latch, not any rendering/sound, to keep this a pure network/state class.
  *
  * <p><b>Signed, for a sharp reason.</b> The first version of this class checked the downloaded jar's
  * SHA-256 against whatever latest.json itself declared — which only proves the download matches the file,

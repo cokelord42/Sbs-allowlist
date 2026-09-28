@@ -158,6 +158,8 @@ public class VisitorShoppingListFeature extends Feature {
 		return false;
 	}
 
+	private ItemStack lastReadStack;
+
 	private void updateFromCurrentVisitor(AbstractContainerScreen<?> screen) {
 		AbstractContainerMenu menu = screen.getMenu();
 		if (menu.slots.size() <= ACCEPT_SLOT) return;
@@ -165,7 +167,10 @@ public class VisitorShoppingListFeature extends Feature {
 		ItemStack infoStack = menu.getSlot(INFO_SLOT).getItem();
 		if (!isVisitorInfo(infoStack)) return;
 		ItemStack acceptStack = menu.getSlot(ACCEPT_SLOT).getItem();
+		// Same offer item as last frame → the shopping list is already recorded.
+		if (acceptStack == lastReadStack) return;
 		if (!"Accept Offer".equals(acceptStack.getHoverName().getString())) return;
+		lastReadStack = acceptStack;
 
 		perVisitor.put(infoStack.getHoverName().getString(), readShoppingList(acceptStack));
 	}

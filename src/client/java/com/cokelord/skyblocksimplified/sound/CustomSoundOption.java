@@ -115,7 +115,10 @@ public final class CustomSoundOption {
 	public void setCustomFilePath(String path) { customFilePath = path; }
 
 	public float getVolume() { return volume; }
-	public void setVolume(float value) { volume = Math.max(0f, Math.min(2f, value)); }
+	// Per user request ("Make the volume sliders extend to 5 instead of 2... giving a 500% volume boost from
+	// base volume"): raised from a 0-2 ceiling to 0-5 — see SoundEngineVolumeMixin's own doc comment for the
+	// matching built-in-sound-path ceiling this needs to stay in sync with.
+	public void setVolume(float value) { volume = Math.max(0f, Math.min(5f, value)); }
 
 	public float getPitch() { return pitch; }
 	public void setPitch(float value) { pitch = Math.max(0f, Math.min(2f, value)); }

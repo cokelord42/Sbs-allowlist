@@ -28,6 +28,13 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * before anything downstream reads it. This also means {@code MainScreen.extractBackground()} no longer
  * needs to touch the real option at all — see its own updated doc comment — so the previous
  * "flips your Graphics Preset to Custom" side effect is gone too.
+ *
+ * <p>Per later user request, this screen's blur now fades in/out with the open/close animations instead of
+ * snapping instantly — see {@code MainScreen.updateBlurFade}/{@code effectiveBlurAmount}'s own doc comments
+ * for that (and for a real 0-100 raw-range detour that was tried and reverted after it made the actual blur
+ * 10x stronger than before instead of just adding more fade steps — the real fix ended up being the fade's
+ * timing CURVE, not its step count, so this redirect still returns a plain 0-10 value exactly as before).
+ * The redirect itself needed no change for any of that; only {@code MainScreen}'s own internal fade logic did.
  */
 @Mixin(GameRenderer.class)
 public class GameRendererBlurMixin {
@@ -35,9 +42,12 @@ public class GameRendererBlurMixin {
 	private int skyblocksimplified$overrideMenuBlur(Options instance) {
 		// Reads through MainScreen.effectiveBlurAmount() (not the slider directly) so this real vanilla read
 		// site and MainScreen.extractBackground()'s own blur-pass trigger can never disagree — see that
-		// method's doc comment for why Transparent panel theme forces a floor here too.
-		if (Minecraft.getInstance().gui.screen() instanceof MainScreen && MainScreen.effectiveBlurAmount() >= 1) {
-			return MainScreen.effectiveBlurAmount();
+		// method's doc comment for why Transparent panel theme forces a floor here too. No longer a bare
+		// type-qualified call — effectiveBlurAmount() reads this screen's own live fade state now (a real
+		// per-instance animation, not a stateless combination of other features' settings), so the live
+		// MainScreen instance itself has to be bound instead.
+		if (Minecraft.getInstance().gui.screen() instanceof com.cokelord.skyblocksimplified.gui.BlurringScreen screen && screen.effectiveBlurAmount() >= 1) {
+			return screen.effectiveBlurAmount();
 		}
 		return instance.getMenuBackgroundBlurriness();
 	}

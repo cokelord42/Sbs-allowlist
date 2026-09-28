@@ -15,6 +15,12 @@ import java.util.regex.Pattern;
  * PartyApi.kt, keeping its confirmed join/leave/kick/disconnect/transfer/disband patterns and the
  * "/party list" response patterns. Doesn't cover the Kuudra/Dungeon Party Finder join lines or the
  * Spongebob easter egg — those aren't needed for a simple "who's in my party" tracker.
+ *
+ * <p>Per user request, following up on the "chat commands don't work in party" leader-detection
+ * regression: {@link #isLeader()}/{@link #leader()} now prefer Hypixel's own real Mod API party packet
+ * (see {@link HypixelPartyApi}) whenever it has a confirmed answer, falling back to this class's own
+ * passive chat tracking otherwise (membership also resyncs from the Mod API party packet). That tracking is left fully in place — it's still the only
+ * source for the full member list, and the fallback for a session where the Mod API bridge isn't active.
  */
 public final class PartyApi {
 	private PartyApi() {}
@@ -58,6 +64,22 @@ public final class PartyApi {
 	private static final Pattern KICKED = Pattern.compile("You have been kicked from the party by .*");
 	private static final Pattern MEMBERS_START = Pattern.compile("Party Members \\(\\d+\\)");
 	private static final Pattern MEMBER_LIST = Pattern.compile("Party (?<kind>Leader|Moderators|Members): (?<names>.*)");
+	// Real, confirmed lines cross-checked against Odin's own PartyUtils.kt (the user provided its source
+	// specifically to fix this) — three more organic, passive signals for the party leader that this class
+	// was missing entirely, none of which need this class to ever send anything: Hypixel's own leader-
+	// disconnect/rejoin notices, and the fact that only the real leader can ever send a party into the
+	// Dungeon/Kuudra finder queue. Odin's own version relies on passive signals like these ALONE — see
+	// register()'s own doc comment for why this codebase still keeps one active fallback probe on top,
+	// rather than matching Odin's design exactly.
+	private static final Pattern LEADER_DISCONNECTED = Pattern.compile(
+		"The party leader, (?<name>.*) has disconnected, they have 5 minutes to rejoin before the party is disbanded\\.");
+	private static final Pattern LEADER_REJOINED = Pattern.compile("The party leader (?<name>.*) has rejoined\\.");
+	private static final Pattern QUEUED_IN_FINDER = Pattern.compile("Party Finder > Your party has been queued in the dungeon finder!");
+	// Odin's own heuristic, not a certainty (with the "All Invite" party setting on, a non-leader can also
+	// invite) — only ever used to fill in an otherwise-unknown leader, same "last resort, never overwrites a
+	// real known value" spirit as every other guess in this class.
+	private static final Pattern PARTY_INVITE = Pattern.compile(
+		"(?<inviter>.*) invited (?<invitee>.*) to the party! They have 60 seconds to accept\\.");
 
 	// Per user request ("hide the 'You are not currently in a party.' spam from the mod's own silent
 	// /party list probe"): Hypixel wraps that reply (and the "you're in a party" success reply below) in
@@ -91,14 +113,31 @@ public final class PartyApi {
 	}
 
 	/** Null if not in a party or the leader hasn't been observed yet (e.g. joined before this tracker
-	 *  saw a "/party list" response). */
+	 *  saw a "/party list" response). Prefers the Mod-API-confirmed leader — see {@link #confirmedLeader()}. */
 	public static String leader() {
-		return partyLeader;
+		String confirmed = confirmedLeader();
+		return confirmed != null ? confirmed : partyLeader;
 	}
 
 	public static boolean isLeader() {
 		Minecraft mc = Minecraft.getInstance();
-		return partyLeader != null && mc.player != null && partyLeader.equals(mc.player.getName().getString());
+		if (mc.player == null) return false;
+		String confirmed = confirmedLeader();
+		if (confirmed != null) return confirmed.equals(mc.player.getName().getString());
+		return partyLeader != null && partyLeader.equals(mc.player.getName().getString());
+	}
+
+	/** Real, server-confirmed leader per Hypixel's own Mod API party packet (see {@link HypixelPartyApi}),
+	 *  when available — always preferred over the passive chat-scraped {@link #partyLeader} the same way
+	 *  IslandGate always prefers a confirmed Mod API island over its own sidebar fallback. Discovered while
+	 *  fixing the "chat commands don't work in party" regression (per user question: "doesnt hypixel mod api
+	 *  feed party data?") — this is a real fix for the underlying fragility, not just the one regression:
+	 *  every {@code isLeader()}-gated command now has an authoritative source that doesn't depend on having
+	 *  organically observed a join/transfer line or having Hypixel's opt-in Party tab-list widget enabled.
+	 *  Falls back to the chat-scraped value whenever the Mod API bridge isn't active, hasn't received a
+	 *  response yet, or the leader's UUID doesn't resolve to a name in this client's local player-info cache. */
+	private static String confirmedLeader() {
+		return isModApiActive() ? HypixelPartyApi.confirmedLeaderName() : null;
 	}
 
 	// Real bug found (per user report — "Chat commands actually does not work in a party"): every leader-
@@ -108,13 +147,71 @@ public final class PartyApi {
 	// line. If the party already existed before this listener started watching this session (rejoining a
 	// world/server mid-party, a reconnect, or simply never having run `/party list` since login), the leader
 	// is never learned at all and stays null for the rest of the session — silently no-opping every one of
-	// those commands with zero feedback, for the real leader included. Self-heals now by silently requesting
-	// `/party list` shortly after every Hypixel connection — Hypixel's own reply (whether "you're in a
-	// party, here's who" or "you're not in a party") is exactly the real signal onChat() already parses
-	// correctly, so this just makes sure that signal actually gets asked for at least once per session
-	// instead of only ever arriving by chance.
+	// those commands with zero feedback, for the real leader included. Self-heals via the "known members,
+	// unknown leader" check at the bottom of onChat(), which schedules a silent `/party list` probe.
+	//
+	// Real bug found (per user report — "the /p list thing is still a thing even though it can read the
+	// tablist... is it even important, can it be tablist read instead?"): this schedules the same probe
+	// exactly {@link #BOOTSTRAP_DELAY_MILLIS} after every Hypixel connection — a round later, that scheduling
+	// was removed outright (kept only as a REACTIVE "known members, unknown leader" check further down),
+	// since the tablist scan below covers the common "joined mid-party" gap more precisely. That overcorrected
+	// into a real regression (per a later report — "party commands don't work... guild worked... either
+	// entirely broken or its only party"): a player reconnecting to an ALREADY-EXISTING party gets no organic
+	// join/transfer line at all (nobody just joined), and the tablist scan only works if the player has
+	// Hypixel's own opt-in "Party" tab-list widget enabled — with neither signal, partyLeader stayed null for
+	// the entire session, silently no-oping every leader-gated command while guild's (which don't check
+	// isLeader() at all) kept working. Restored, but the actual send now only happens if the leader is STILL
+	// unknown once the delay elapses (see the join-triggered scheduling's own doc comment) — so it's a real
+	// guaranteed fallback again without reintroducing the original "runs every login even when unneeded"
+	// complaint. Checked Odin's own PartyUtils.kt (the user provided its source): Odin never sends
+	// `/party list` at all — it's purely passive. Rather than copy that exactly (which really does just
+	// accept "leader unknown" for however long no organic signal happens to fire), this keeps the probe as a
+	// real last-resort AND adds three more organic signals Odin's own file has that this class was missing
+	// (leader disconnect/rejoin notices, and the dungeon/Kuudra-finder queue confirmation only a real leader
+	// can trigger — see LEADER_DISCONNECTED/LEADER_REJOINED/QUEUED_IN_FINDER above), so the probe should
+	// rarely need to actually fire in practice even though it's always scheduled.
 	private static final long BOOTSTRAP_DELAY_MILLIS = 3_000L;
 	private static Long bootstrapAtMillis = null;
+
+	private static Boolean modApiActive = null;
+
+	/** Same lazy, defensive pattern as IslandGate.isModApiActive() — checked/started lazily since Fabric's
+	 *  mod list isn't guaranteed populated before this class's own static init, and wrapped so any
+	 *  unexpected bridge failure just falls back to the existing chat-scraping approach instead of breaking
+	 *  party tracking entirely. */
+	private static boolean isModApiActive() {
+		if (modApiActive == null) {
+			boolean loaded = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("hypixel-mod-api");
+			if (loaded) {
+				try {
+					HypixelPartyApi.start();
+					modApiActive = true;
+				} catch (Throwable t) {
+					com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error(
+						"HypixelPartyApi bridge failed to start, falling back to chat-scraped party leader", t);
+					modApiActive = false;
+				}
+			} else {
+				modApiActive = false;
+			}
+		}
+		return modApiActive;
+	}
+
+	/** Fires the Mod API's own request half of the party-info request/response pair (see
+	 *  HypixelPartyApi's own doc comment on why this isn't an EventPacket) — a no-op if the bridge isn't
+	 *  active. Safe to call from any real party-change signal; never called on a timer. */
+	private static void requestModApiUpdate() {
+		if (isModApiActive()) HypixelPartyApi.requestUpdate();
+	}
+
+	/** Asks Hypixel's Mod API for fresh party info (answered via HypixelPartyApi listeners).
+	 *  @return false when the Mod API bridge isn't installed/active. */
+	public static boolean requestModApiPartyInfo() {
+		if (!isModApiActive()) return false;
+		HypixelPartyApi.requestUpdate();
+		return true;
+	}
 
 	public static synchronized void register() {
 		if (registered) return;
@@ -129,11 +226,38 @@ public final class PartyApi {
 				return true;
 			}
 		});
-		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> bootstrapAtMillis = System.currentTimeMillis() + BOOTSTRAP_DELAY_MILLIS);
-		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> bootstrapAtMillis = null);
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+			bootstrapAtMillis = null;
+			modApiActive = null;
+			HypixelPartyApi.reset();
+		});
+		// Real bug found (per user report — "Chat commands don't seem to work in party... guild worked
+		// earlier either chat commands are entirely broken or its only party"): removing this JOIN trigger
+		// entirely (see its own removal's doc comment below) also removed the ONLY fallback for reconnecting
+		// to a party that already existed before this session started — no organic join/transfer line ever
+		// fires for a party nobody just joined, and the tablist scan only works at all if the player has
+		// Hypixel's own opt-in "Party" tab-list widget enabled. Without either signal, partyMembers/
+		// partyLeader stayed null for the WHOLE session, silently no-oping every leader-gated party command
+		// (isLeader() requires a known leader) while guild commands — which don't depend on this at all —
+		// kept working, exactly the reported split. Restored, but the actual send below is now gated on
+		// still not knowing the leader once the delay elapses (see that check's own doc comment) instead of
+		// firing unconditionally, so the original redundant-probe complaint this was removed for doesn't come
+		// back either: tablist/chat resolving the leader first (very likely well within this delay) still
+		// skips it completely.
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+			bootstrapAtMillis = System.currentTimeMillis() + BOOTSTRAP_DELAY_MILLIS;
+			// Fire the real authoritative request immediately (a tiny custom-payload packet, not a visible
+			// chat command — no reason to wait the same delay the chat-based /party list fallback needs).
+			requestModApiUpdate();
+		});
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (bootstrapAtMillis == null || System.currentTimeMillis() < bootstrapAtMillis) return;
 			bootstrapAtMillis = null;
+			// Only actually send the probe if something (tablist scan, an organic chat line, this same check
+			// firing earlier from the reactive "known members, unknown leader" trigger) hasn't already
+			// resolved the leader by now — the real fix for "redundant /party list on every login" was never
+			// removing this check outright, just skipping the SEND once it's genuinely not needed anymore.
+			if (partyLeader != null) return;
 			if (client.player != null && client.player.connection != null) {
 				// The reply to THIS specific silent probe is what gets hidden if it's the "not in a party"
 				// flavor — start watching for it right as it's sent.
@@ -142,73 +266,36 @@ public final class PartyApi {
 				client.player.connection.sendCommand("party list");
 			}
 		});
-		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			try {
-				scanTabListParty();
-			} catch (Exception e) {
-				com.cokelord.skyblocksimplified.SkyblockSimplified.LOGGER.error("PartyApi tablist scan threw, skipping this tick", e);
-			}
-		});
+		// Per user request ("remove the tablist reading for party since we use hypixel-mod-api"): membership
+		// now also comes from the Mod API party packet (UUID-keyed, server-confirmed) instead of scanning the
+		// opt-in Party tab-list widget every tick.
+		if (isModApiActive()) {
+			HypixelPartyApi.addListener(packet -> Minecraft.getInstance().execute(() -> applyModApiParty(packet)));
+		}
 	}
 
-	// Per user request ("I also figured out another way of getting the party instead of using /party list
-	// and reading the chat messages. It can detect through the tablist... a line saying 'Party: n/5' then 5
-	// lines saying the entire party list"): a real Hypixel tab-list widget (opt-in in their own settings,
-	// same category as the Pests/Jacob's Contest widgets TabListReader already reads for other features),
-	// scanned every tick as a second, self-correcting membership source alongside the chat-based tracking
-	// above rather than replacing it — chat lines can be missed (client just connected mid-party, a message
-	// dropped), while this widget reflects the CURRENT true membership every time it's visible. Every match
-	// overwrites partyMembers/partyLeader wholesale, the same full-resync treatment MEMBER_LIST's own
-	// "/party list" reply already gets, since re-deriving from scratch here is just as cheap and immune to
-	// drift from a stale add/remove.
-	private static final Pattern TABLIST_PARTY_HEADER = Pattern.compile("Party: (\\d+)/5");
-	private static final int TABLIST_MAX_MEMBERS = 5;
-	// Only warn once per session, and only after enough consecutive misses that a player who simply doesn't
-	// have their tab list open right now isn't told to change a setting they already have right.
-	private static final int MISSING_WIDGET_WARNING_TICKS = 20 * 30;
-	private static int ticksSinceTablistPartySeen = 0;
-	private static boolean warnedMissingTablistWidget = false;
-
-	private static void scanTabListParty() {
-		java.util.List<String> lines = com.cokelord.skyblocksimplified.hud.TabListReader.readLines();
-		int headerIndex = -1;
-		int expectedCount = 0;
-		for (int i = 0; i < lines.size(); i++) {
-			Matcher m = TABLIST_PARTY_HEADER.matcher(lines.get(i).replaceAll("§.", ""));
-			if (m.find()) {
-				headerIndex = i;
-				expectedCount = Integer.parseInt(m.group(1));
-				break;
-			}
-		}
-		if (headerIndex == -1) {
-			ticksSinceTablistPartySeen++;
-			if (!warnedMissingTablistWidget && !partyMembers.isEmpty()
-				&& ticksSinceTablistPartySeen > MISSING_WIDGET_WARNING_TICKS) {
-				warnedMissingTablistWidget = true;
-				Minecraft mc = Minecraft.getInstance();
-				if (mc.player != null) {
-					mc.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-						"§e[SBS] §fEnable the Party tab-list widget in Hypixel's own settings for more reliable party tracking."));
-				}
-			}
+	/** Resyncs members/leader from a Mod API party packet. A member whose UUID isn't in this client's
+	 *  player-info cache yet (not on this server) keeps whatever chat tracking already knew, so an
+	 *  incomplete resolution never shrinks a correct list. */
+	private static void applyModApiParty(net.hypixel.modapi.packet.impl.clientbound.ClientboundPartyInfoPacket packet) {
+		if (!packet.isInParty()) {
+			partyMembers.clear();
+			partyLeader = null;
 			return;
 		}
-		ticksSinceTablistPartySeen = 0;
-		warnedMissingTablistWidget = false;
-		if (expectedCount <= 0) return;
-
-		java.util.Set<String> scanned = new LinkedHashSet<>();
-		for (int i = headerIndex + 1; i < lines.size() && scanned.size() < Math.min(expectedCount, TABLIST_MAX_MEMBERS); i++) {
-			String name = cleanName(lines.get(i));
-			if (!name.isBlank() && name.matches("\\w{1,16}")) scanned.add(name);
+		Minecraft mc = Minecraft.getInstance();
+		if (mc.getConnection() == null) return;
+		java.util.Set<String> resolved = new LinkedHashSet<>();
+		boolean allResolved = true;
+		for (java.util.UUID uuid : packet.getMembers()) {
+			var info = mc.getConnection().getPlayerInfo(uuid);
+			if (info != null) resolved.add(info.getProfile().name());
+			else allResolved = false;
 		}
-		if (scanned.isEmpty()) return;
-
-		partyMembers.clear();
-		for (String name : scanned) addPlayer(name);
-		// Real, honest limitation: the widget doesn't mark who the leader is, so a leader already known from
-		// chat tracking is preserved rather than being blanked out by a resync that has no opinion on it.
+		if (allResolved) partyMembers.clear();
+		for (String name : resolved) addPlayer(name);
+		String leaderName = HypixelPartyApi.confirmedLeaderName();
+		if (leaderName != null) partyLeader = leaderName;
 	}
 
 	/** @return false to cancel/hide this chat line, true to let it render normally. */
@@ -247,9 +334,29 @@ public final class PartyApi {
 		if (matcher.matches()) {
 			partyLeader = cleanName(matcher.group("newowner"));
 			partyMembers.remove(cleanName(matcher.group("name")));
+			requestModApiUpdate();
 		}
 		matcher = TRANSFER_VOLUNTARY.matcher(stripped.replaceAll("§.", ""));
-		if (matcher.matches()) partyLeader = cleanName(matcher.group("newowner"));
+		if (matcher.matches()) {
+			partyLeader = cleanName(matcher.group("newowner"));
+			requestModApiUpdate();
+		}
+
+		String noColor = stripped.replaceAll("§.", "");
+		matcher = LEADER_DISCONNECTED.matcher(noColor);
+		if (matcher.matches()) partyLeader = cleanName(matcher.group("name"));
+		matcher = LEADER_REJOINED.matcher(noColor);
+		if (matcher.matches()) {
+			partyLeader = cleanName(matcher.group("name"));
+			requestModApiUpdate();
+		}
+		if (QUEUED_IN_FINDER.matcher(noColor).matches() && partyLeader == null) partyLeader = selfName();
+		matcher = PARTY_INVITE.matcher(noColor);
+		if (matcher.matches()) {
+			String inviter = cleanName(matcher.group("inviter"));
+			addPlayer(inviter);
+			if (partyLeader == null) partyLeader = inviter;
+		}
 
 		// Real bug found: these literal comparisons still had the exact same baked-in "§e"/"§c" color-code
 		// prefixes the field-level comment above already diagnosed and fixed for the regex Patterns — missed
@@ -293,6 +400,7 @@ public final class PartyApi {
 		// silent "/party list" request): whenever known members exist but the leader is still unknown, ask.
 		if (!partyMembers.isEmpty() && partyLeader == null && bootstrapAtMillis == null) {
 			bootstrapAtMillis = System.currentTimeMillis() + BOOTSTRAP_DELAY_MILLIS;
+			requestModApiUpdate();
 		}
 
 		return allow;

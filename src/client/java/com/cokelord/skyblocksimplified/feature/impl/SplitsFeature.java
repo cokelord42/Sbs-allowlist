@@ -473,11 +473,10 @@ public class SplitsFeature extends Feature implements MoveableWidget {
 		return times;
 	}
 
-	/** See the doc comment at computeTimes()'s live-split branch above — same TpsMonitor-ratio scaling
-	 *  DungeonTimersFeature.lagAdjustedElapsed() already uses for its own future-event countdowns. */
+	/** See the doc comment at computeTimes()'s live-split branch above — counts server ticks via ServerClock,
+	 *  same as DungeonTimersFeature.lagAdjustedElapsed(). */
 	private static long lagAdjustedElapsed(long realElapsedMillis) {
-		double tps = com.cokelord.skyblocksimplified.util.TpsMonitor.getEstimatedTps();
-		return Math.round(realElapsedMillis * (tps / 20.0));
+		return com.cokelord.skyblocksimplified.util.ServerClock.elapsedMillis(realElapsedMillis);
 	}
 
 	private void chatMessage(String message) {

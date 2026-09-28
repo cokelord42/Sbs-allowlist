@@ -147,6 +147,9 @@ public class RareRewardWarningFeature extends Feature {
 		return mc.gui.screen() instanceof AbstractContainerScreen<?> screen && isRareOfferShowing(screen);
 	}
 
+	private ItemStack lastEstimatedStack;
+	private double lastEstimatedValue;
+
 	private void renderIfVisitorOffer(GuiGraphicsExtractor graphics, AbstractContainerScreen<?> screen) {
 		AbstractContainerMenu menu = screen.getMenu();
 		if (menu.slots.size() <= REFUSE_SLOT) return;
@@ -156,7 +159,12 @@ public class RareRewardWarningFeature extends Feature {
 		ItemStack acceptStack = menu.getSlot(ACCEPT_SLOT).getItem();
 		if (!"Accept Offer".equals(acceptStack.getHoverName().getString())) return;
 
-		double estimatedValue = ChestValueEstimator.estimate(acceptStack, false);
+		// Re-estimated only when the offer item actually changes, not every frame.
+		if (acceptStack != lastEstimatedStack) {
+			lastEstimatedStack = acceptStack;
+			lastEstimatedValue = ChestValueEstimator.estimate(acceptStack, false);
+		}
+		double estimatedValue = lastEstimatedValue;
 
 		AbstractContainerScreenAccessor accessor = (AbstractContainerScreenAccessor) screen;
 		int leftPos = accessor.skyblocksimplified$getLeftPos();

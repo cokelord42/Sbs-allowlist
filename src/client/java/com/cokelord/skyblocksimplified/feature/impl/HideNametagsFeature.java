@@ -34,6 +34,10 @@ public class HideNametagsFeature extends Feature {
 	private boolean onlyInDungeons = false;
 	private static boolean listenersRegistered = false;
 	private static HideNametagsFeature instance;
+	// See onEnable()'s own render-callback registration for why this runs every frame, and
+	// PerformanceTogglesFeature.isThrottleNametagHiding()'s own tooltip for the real tradeoff a player opts
+	// into by throttling it back down.
+	private static int frameCounter = 0;
 
 	public HideNametagsFeature() {
 		super("performance_hide_nametags", "Hide Nametags", FeatureCategory.PERFORMANCE, false);
@@ -58,6 +62,14 @@ public class HideNametagsFeature extends Feature {
 	}
 
 	private void hideAll() {
+		// Real cost found (per a perf-optimization pass): this walks the whole render-distance entity list
+		// every single FRAME (not tick) by design — see onEnable()'s own doc comment on why it was moved off
+		// onTick in the first place (a real multi-frame nametag flash on newly-visible entities). Opt-in via
+		// Performance Toggles (default off — unthrottled, matching this feature's existing behavior): only
+		// every 4th frame when enabled, which reintroduces a small version of that exact flash on an entity
+		// that just entered render range, in exchange for a real ~4x cut to how often this scan runs.
+		if (PerformanceTogglesFeature.isThrottleNametagHiding() && frameCounter++ % 4 != 0) return;
+
 		Minecraft mc = Minecraft.getInstance();
 		if (mc.level == null) return;
 		if (onlyInDungeons && !DungeonState.isInDungeon()) return;

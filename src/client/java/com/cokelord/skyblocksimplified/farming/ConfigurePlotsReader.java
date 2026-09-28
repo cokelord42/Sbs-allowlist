@@ -65,6 +65,9 @@ public final class ConfigurePlotsReader {
 		registered = true;
 		ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
 			if (!(screen instanceof AbstractContainerScreen<?> containerScreen)) return;
+			// A container's title is fixed for the screen's lifetime — check it once here instead of
+			// regex-stripping it every frame on every open menu.
+			if (!containerScreen.getTitle().getString().replaceAll("§.", "").trim().equals(INVENTORY_TITLE)) return;
 			// Scoped to this one screen instance (not a static field) so it naturally resets every time the
 			// player reopens the menu, with no separate ScreenEvents.remove bookkeeping needed.
 			boolean[] announcedThisOpen = {false};

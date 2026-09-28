@@ -45,28 +45,45 @@ public final class MobHighlightRegistry {
 	public static void setRule(String id, Predicate<Entity> matcher, int color,
 								com.cokelord.skyblocksimplified.feature.impl.MobHighlightFeature owner) {
 		rules.put(id, new Rule(matcher, color, owner));
+		cache.clear();
 	}
 
 	public static void clearRule(String id) {
 		rules.remove(id);
+		cache.clear();
+	}
+
+	// Per-entity, per-tick result of the rule scan (see TickCache). NONE = "no rule matched".
+	private static final TickCache.PerTick<Object> cache = new TickCache.PerTick<>();
+	private static final Object NONE = new Object();
+
+	@SuppressWarnings("unchecked")
+	private static Map.Entry<String, Rule> cachedEntry(Entity entity) {
+		if (rules.isEmpty()) return null;
+		Object hit = cache.get(entity.getId());
+		if (hit == null) {
+			Map.Entry<String, Rule> found = null;
+			for (Map.Entry<String, Rule> entry : rules.entrySet()) {
+				if (entry.getValue().matcher().test(entity)) { found = entry; break; }
+			}
+			hit = found != null ? found : NONE;
+			cache.put(entity.getId(), hit);
+		}
+		return hit == NONE ? null : (Map.Entry<String, Rule>) hit;
 	}
 
 	/** The ARGB color to outline this entity with, or 0 if no rule matches (no highlight). */
 	public static int getColorFor(Entity entity) {
-		for (Rule rule : rules.values()) {
-			if (rule.matcher().test(entity)) return rule.color();
-		}
-		return 0;
+		Map.Entry<String, Rule> e = cachedEntry(entity);
+		return e != null ? e.getValue().color() : 0;
 	}
 
 	/** The id of whichever rule matched, or null — used by HighlightBoxRenderer to look the owning
 	 *  Feature back up (by id, via FeatureRegistry) so it can read that feature's own render-mode
 	 *  settings instead of duplicating them here. */
 	public static String getMatchedRuleId(Entity entity) {
-		for (Map.Entry<String, Rule> entry : rules.entrySet()) {
-			if (entry.getValue().matcher().test(entity)) return entry.getKey();
-		}
-		return null;
+		Map.Entry<String, Rule> e = cachedEntry(entity);
+		return e != null ? e.getKey() : null;
 	}
 
 	/** The whole matched {@link Rule} (color + owning feature, if any) for this entity, or null if nothing
@@ -74,20 +91,15 @@ public final class MobHighlightRegistry {
 	 *  own doc comment for why HighlightBoxRenderer reads the owner from here now instead of re-deriving it
 	 *  from the rule id via FeatureRegistry. */
 	public static Rule getMatchedRule(Entity entity) {
-		for (Rule rule : rules.values()) {
-			if (rule.matcher().test(entity)) return rule;
-		}
-		return null;
+		Map.Entry<String, Rule> e = cachedEntry(entity);
+		return e != null ? e.getValue() : null;
 	}
 
 	/** Both the matched rule id and its {@link Rule} in one pass — avoids scanning every registered rule's
 	 *  predicate a second time just to also learn which id matched (HighlightBoxRenderer needs both: the id
 	 *  for its own per-rule Y-offset tuning, the Rule for color/owning-feature). */
 	public static Map.Entry<String, Rule> getMatchedEntry(Entity entity) {
-		for (Map.Entry<String, Rule> entry : rules.entrySet()) {
-			if (entry.getValue().matcher().test(entity)) return entry;
-		}
-		return null;
+		return cachedEntry(entity);
 	}
 
 	public static java.util.Set<String> ruleIds() {

@@ -14,15 +14,21 @@ public abstract class Feature {
 	private final FeatureCategory category;
 	private final boolean enabledByDefault;
 	private boolean enabled;
-	// Debounces rapid on/off spam (0.5s, per user request) — several features tear down and rebuild
-	// state in onEnable/onDisable (HudElementRegistry add/remove, chat listeners, etc.) that isn't
-	// guaranteed to apply synchronously; spamming the toggle faster than that could re-add a layer before
-	// the previous removal had actually taken effect, silently leaving the feature "on" in the GUI but
-	// permanently gone in reality (this is exactly what broke Custom Scoreboard before — see its onEnable
-	// doc comment). Applied once here instead of per-feature so every toggle in the mod is covered.
-	private static final long TOGGLE_DEBOUNCE_MS = 500;
-	private long lastToggleTimeMs = -TOGGLE_DEBOUNCE_MS;
-
+	// Real bug found (per user report — "make sure all detection features work when disabled. This is/was
+	// an issue with boss guide, where if i disabled and enabled it in boss it broke completely"): this used
+	// to silently REJECT a genuine state-changing toggle request that arrived within 500ms of the last one —
+	// this.enabled simply never updated and onEnable()/onDisable() never ran, with no error and no retry.
+	// The very next toggle attempt only re-synced once a further 500ms had passed since the last SUCCESSFUL
+	// toggle, so a quick disable-then-re-enable (exactly the kind of rapid click a user does to "refresh" a
+	// module that looks stuck) could leave the feature internally disabled — checkbox and all — even though
+	// the user's last real click asked for it to be ON. The original per-feature race this guarded against
+	// (two overlapping onEnable/onDisable calls racing an ASYNC HudElementRegistry add/remove) no longer
+	// applies to how features are actually built now: every current onEnable/onDisable either registers its
+	// HUD element/listener exactly ONCE ever (a static registered-guard, gating real work on a live
+	// isEnabled() check every frame instead) or unconditionally removes-then-adds idempotently on every call
+	// (see TabWidgetOverlayFeature's own onEnable doc comment) — neither shape has anything left for a
+	// debounce to protect. Removed outright rather than reworked into a queued/delayed-apply model: the
+	// simplest fix that can never again silently diverge from the user's actual last click.
 	protected Feature(String id, String displayName, FeatureCategory category, boolean enabledByDefault) {
 		this.id = id;
 		this.displayName = displayName;
@@ -52,9 +58,6 @@ public abstract class Feature {
 
 	public void setEnabled(boolean enabled) {
 		if (this.enabled == enabled) return;
-		long now = System.currentTimeMillis();
-		if (now - lastToggleTimeMs < TOGGLE_DEBOUNCE_MS) return;
-		lastToggleTimeMs = now;
 		this.enabled = enabled;
 		if (enabled) {
 			onEnable();
@@ -113,6 +116,12 @@ public abstract class Feature {
 	 *  menu's search jump right alongside the real display name, ranked just below it (a real alias should
 	 *  win over a mere sub-setting match). */
 	public java.util.List<String> getSearchAliases() {
+		return java.util.List.of();
+	}
+
+	/** Declarative settings panel — see {@link SettingRow}. Non-empty makes MainScreen draw the cog and the
+	 *  whole panel from this list. Rebuilt on every call, so rows may depend on current state. */
+	public java.util.List<SettingRow> getSettingRows() {
 		return java.util.List.of();
 	}
 

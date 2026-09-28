@@ -142,6 +142,13 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 	// "Crypts"/"Deaths"/"Mimic" words, the deaths count, and the mimic checkmark/X — uses this one color.
 	private int mapInfoTextColor = 0xFFFFFFFF;
 
+	// Per user request ("Odin added websocket support for the dungeon map... Make it prioritize sending
+	// websocket data but if it cant find any it should fall back to our method"): matches Odin's own real
+	// "Parse map websocket" setting — gates only the RECEIVE side of DungeonMapSync (adopting a teammate's
+	// broadcast secrets count); this client always SENDS its own progress regardless (see DungeonMapSync's
+	// own doc comment on why). Defaults on, same as Odin's own default.
+	private boolean parseMapWebsocket = true;
+
 	private final HudPosition defaultPosition = new HudPosition(0.85f, 0.3f, 1f);
 	private final HudPosition position = defaultPosition.copy();
 
@@ -827,6 +834,7 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 			// still resolves correctly the moment the map's own decorations for the OTHER teammates update,
 			// since the matcher works across all of them at once rather than one at a time.
 			java.util.List<DungeonPlayer> needsFallback = new java.util.ArrayList<>();
+			java.util.List<float[]> livePositions = new java.util.ArrayList<>();
 			for (DungeonPlayer player : DungeonState.getTeammates()) {
 				Player entity = player.entity;
 				AbstractClientPlayer acp = entity instanceof AbstractClientPlayer ap ? ap : null;
@@ -836,6 +844,7 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 					player.lastWorldX = worldX;
 					player.lastWorldZ = worldZ;
 					player.lastSeenAtMillis = System.currentTimeMillis();
+					livePositions.add(new float[]{worldX, worldZ});
 					drawTeammateMarker(graphics, mc, player, worldX, worldZ, player.getRenderYaw(), acp.getSkin(),
 						x, y, cell, heads, showNames, outHits);
 				} else {
@@ -844,6 +853,23 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 			}
 			if (!needsFallback.isEmpty()) {
 				java.util.List<net.minecraft.world.level.saveddata.maps.MapDecoration> unclaimedBlueMarkers = collectBlueMarkerDecorations();
+				// Per user report ("It seems to stack heads on the map now instead of tracking the arrows"): the
+				// map carries a blue arrow for EVERY teammate, including the ones already drawn from their live
+				// entity above — those arrows used to stay claimable, so an out-of-render teammate could be
+				// matched onto a visible teammate's arrow and both heads stacked there. Each live teammate
+				// removes the arrow nearest to it first, leaving only the arrows of teammates we can't see.
+				for (float[] live : livePositions) {
+					net.minecraft.world.level.saveddata.maps.MapDecoration nearest = null;
+					double nearestSq = LIVE_ARROW_CLAIM_RADIUS * LIVE_ARROW_CLAIM_RADIUS;
+					for (var deco : unclaimedBlueMarkers) {
+						float[] world = decorationPixelToWorld(deco);
+						if (world == null) continue;
+						double dx = world[0] - live[0], dz = world[1] - live[1];
+						double sq = dx * dx + dz * dz;
+						if (sq <= nearestSq) { nearestSq = sq; nearest = deco; }
+					}
+					if (nearest != null) unclaimedBlueMarkers.remove(nearest);
+				}
 				var matches = matchFallbackTeammates(needsFallback, unclaimedBlueMarkers);
 				for (var entry : matches.entrySet()) {
 					DungeonPlayer player = entry.getKey();
@@ -852,6 +878,10 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 					if (world == null) continue;
 					float worldX = world[0];
 					float worldZ = world[1];
+					// Follow the arrow: remember where it put this teammate, so next frame's nearest-position
+					// match keeps tracking the same arrow instead of comparing against where they were last SEEN.
+					player.lastWorldX = worldX;
+					player.lastWorldZ = worldZ;
 					float yawDeg = deco.rot() * 22.5f;
 					// Real bug found (per user report — "The arrow that displays on the map when a player isnt
 					// within render should look like the regular arrow... It should be able to render player
@@ -926,6 +956,10 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 	// this run, never once seen with a live entity) have nothing to match by — those fall back to the old
 	// first-available order once every teammate with real position memory has already been matched, exactly
 	// like before this fix, since there's genuinely no better information for them yet.
+	// A map pixel is ~1.4 blocks and Hypixel's arrows update a few times a second, so a live teammate's own
+	// arrow sits within a few blocks of their entity.
+	private static final double LIVE_ARROW_CLAIM_RADIUS = 8.0;
+
 	private static java.util.Map<DungeonPlayer, net.minecraft.world.level.saveddata.maps.MapDecoration> matchFallbackTeammates(
 			java.util.List<DungeonPlayer> needsFallback,
 			java.util.List<net.minecraft.world.level.saveddata.maps.MapDecoration> unclaimed) {
@@ -1327,6 +1361,12 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 	public int getMapInfoTextColor() { return mapInfoTextColor; }
 	public void setMapInfoTextColor(int value) { mapInfoTextColor = value; }
 
+	public boolean isParseMapWebsocket() { return parseMapWebsocket; }
+	public void setParseMapWebsocket(boolean value) {
+		parseMapWebsocket = value;
+		com.cokelord.skyblocksimplified.dungeon.map.DungeonMapSync.setAllowReceive(value);
+	}
+
 	@Override
 	public JsonElement savePersistedData() {
 		JsonObject obj = new JsonObject();
@@ -1348,6 +1388,7 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 		obj.addProperty("mapInfoShowDeaths", mapInfoShowDeaths);
 		obj.addProperty("mapInfoShowMimic", mapInfoShowMimic);
 		obj.addProperty("mapInfoTextColor", mapInfoTextColor);
+		obj.addProperty("parseMapWebsocket", parseMapWebsocket);
 		obj.addProperty("anchorX", position.anchorX);
 		obj.addProperty("anchorY", position.anchorY);
 		obj.addProperty("scale", position.scale);
@@ -1376,6 +1417,8 @@ public class DungeonMapFeature extends Feature implements MoveableWidget {
 		if (obj.has("mapInfoShowDeaths")) mapInfoShowDeaths = obj.get("mapInfoShowDeaths").getAsBoolean();
 		if (obj.has("mapInfoShowMimic")) mapInfoShowMimic = obj.get("mapInfoShowMimic").getAsBoolean();
 		if (obj.has("mapInfoTextColor")) mapInfoTextColor = obj.get("mapInfoTextColor").getAsInt();
+		if (obj.has("parseMapWebsocket")) parseMapWebsocket = obj.get("parseMapWebsocket").getAsBoolean();
+		com.cokelord.skyblocksimplified.dungeon.map.DungeonMapSync.setAllowReceive(parseMapWebsocket);
 		if (obj.has("anchorX") && obj.has("anchorY")) {
 			float s = obj.has("scale") ? obj.get("scale").getAsFloat() : position.scale;
 			position.set(obj.get("anchorX").getAsFloat(), obj.get("anchorY").getAsFloat(), s);

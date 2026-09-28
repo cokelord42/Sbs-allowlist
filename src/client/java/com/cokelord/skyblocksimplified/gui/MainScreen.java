@@ -47,7 +47,7 @@ import java.util.function.Consumer;
  * exponential-curve animations throughout (see {@link Anim}). Rectangles/squares stand in for
  * real art until textures exist, same placeholder approach as the mockups themselves.
  */
-public class MainScreen extends Screen {
+public class MainScreen extends Screen implements BlurringScreen {
 	// White silhouettes with the shape carried entirely in alpha — tinted via blit's color-multiply
 	// param, so they track Theme.accent() the same as the placeholder shapes they replaced.
 	private static final net.minecraft.resources.Identifier COG_TEXTURE =
@@ -81,7 +81,7 @@ public class MainScreen extends Screen {
 	private static final int ANIM_ROW_HEIGHT = 28;
 	// 6 duration/blur sliders + 2 toggle rows (cog spin, slider animation) — Pixelated Look's own row is gone
 	// (pixelated is unconditional now, per user request, nothing left for a toggle to control).
-	private static final int ANIM_CONTENT_HEIGHT = ANIM_ROW_HEIGHT * 6 + 16 + 60;
+	private static final int ANIM_CONTENT_HEIGHT = ANIM_ROW_HEIGHT * 5 + 16 + 78;
 	private static final int COLOR_SWATCH_SIZE = 14;
 	private static final String EDIT_GUI_LOCATIONS_SUBCATEGORY = "Edit gui locations";
 
@@ -251,6 +251,29 @@ public class MainScreen extends Screen {
 	private int textSelectionAnchor = -1;
 
 	private final Anim openAnim = new Anim(0f, 0.5f);
+	// Per user request ("I want the background blur to fade in now, so while the opening animation is
+	// playing the background blur should go from 0 to the requested amount in the slider over the
+	// duration... Same with fading out"), then a real bug found in the first implementation (per user report
+	// — "The opening blur doesnt work for this reason i think. It just instantly blurs, no blur fading in.
+	// The closing blur does work however"): the first version reused the shared exponential-decay Anim
+	// class, whose curve is always fastest at the START of any chase regardless of direction (~39% of the
+	// total change happens in just the first 10% of the duration, at this class's own rate formula) — a shape
+	// that reads fine for something DISAPPEARING (a fast initial fade that trails off near-invisible looks
+	// like natural closing motion) but reads as "it just snapped, then barely changed" for something
+	// APPEARING, exactly matching the reported asymmetry (closing "works", opening doesn't). Blur intensity
+	// also perceptually saturates fast on its own (low radii already look meaningfully blurry to the eye),
+	// which compounds with that front-loaded curve for the opening direction specifically. Replaced with an
+	// explicit elapsed-time smoothstep ease (see updateBlurFade()) instead of Anim, which spreads the visible
+	// change evenly across the whole real duration in both directions rather than front-loading it — a
+	// genuine curve-shape fix, not a duration/step-count one. Operates in the plain 0-10 domain, same units
+	// as GuiAnimationsFeature's own slider — see effectiveBlurAmount()/targetBlurAmount() for where this
+	// actually gets read/set. blurFadeCurrent is the one source of truth {@link #effectiveBlurAmount()}
+	// reads; the other three fields just describe the in-flight fade blurFadeCurrent is chasing through.
+	private float blurFadeCurrent = 0f;
+	private float blurFadeFrom = 0f;
+	private int blurFadeTarget = -1;
+	private long blurFadeStartNanos = 0L;
+	private float blurFadeDurationSeconds = 0.5f;
 	// Per user request ("Make the top part (the one with the search part) rise from the bottom, and then
 	// the categories list should extend down from it, and then the module list expands from the categories
 	// list. This should all base happen within 0.5 seconds, and should be able to be sped up and slowed
@@ -301,7 +324,7 @@ public class MainScreen extends Screen {
 	private long closeStartNanos = 0L;
 	private float closeDurationSeconds = 0.3f;
 
-	private static final List<String> SLAYER_TYPES = List.of("General", "Tarantula", "Voidgloom", "Blaze", "Vampire", "Revenant", "Sven");
+	private static final List<String> SLAYER_TYPES = List.of("General", "Revenant", "Tarantula", "Sven", "Voidgloom", "Blaze", "Vampire");
 
 	private FeatureCategory selectedCategory = FeatureCategory.ABOUT;
 	private String selectedSubcategory = null;
@@ -630,6 +653,19 @@ public class MainScreen extends Screen {
 	private boolean configRowVisible = false;
 	private int configImportBoxX, configImportBoxY, configImportBoxWidth, configImportBoxHeight;
 	private int configExportButtonX, configExportButtonY, configExportButtonWidth, configExportButtonHeight;
+	// Per user request ("You can spam the config export, add a live cooldown of 10 seconds on successful
+	// export, and make it count from 10... with one decimal place. It should count where the export text is,
+	// replacing it. Button should stay the same size when counting."): each export button below tracks its own
+	// nanoTime-based cooldown end (0 = not on cooldown); see drawExportButtonWithCooldown, the shared renderer
+	// every one of them uses. Every export button in this screen shares the same 10-second duration.
+	private static final long EXPORT_COOLDOWN_NANOS = 10_000_000_000L;
+	private long configExportCooldownEndNanos = 0L;
+	// Per user request ("allow users to upload txt files containing configs... downloading the txt and
+	// importing it is way easier than opening it up and copying everything" — Discord turns any message over
+	// 2000 characters into a .txt attachment, and a full config export is almost always over that): a compact
+	// button squeezed between the paste box and Export to Clipboard, same row/no-cog-step shape as the rest
+	// of this line — see drawConfigRowInline/attemptConfigFileImport.
+	private int configFileButtonX, configFileButtonY, configFileButtonWidth, configFileButtonHeight;
 
 	// Dungeons Copilot's own standalone export/import row (per user request — "like the mod itself... under
 	// the 'Enabled for class' subtoggle"), same shape as the config box above but scoped to just this one
@@ -638,12 +674,14 @@ public class MainScreen extends Screen {
 	private String copilotImportBuffer = "";
 	private int copilotImportBoxX, copilotImportBoxY, copilotImportBoxWidth, copilotImportBoxHeight;
 	private int copilotExportButtonX, copilotExportButtonY, copilotExportButtonWidth, copilotExportButtonHeight;
+	private long copilotExportCooldownEndNanos = 0L;
 
 	// Positional Messages' own standalone export/import row (per user request: "Positional messages need an
 	// export feature") — same shape as Dungeons Copilot's own config row above.
 	private String posMsgConfigImportBuffer = "";
 	private int posMsgConfigImportBoxX, posMsgConfigImportBoxY, posMsgConfigImportBoxWidth, posMsgConfigImportBoxHeight;
 	private int posMsgConfigExportButtonX, posMsgConfigExportButtonY, posMsgConfigExportButtonWidth, posMsgConfigExportButtonHeight;
+	private long posMsgExportCooldownEndNanos = 0L;
 
 	// Dungeon Routes — same shared-focus text-field pattern as Dungeons Copilot above, keyed by room name
 	// instead of DungeonClass. null selectedRouteRoomName = showing the room-button grid; non-null = editing
@@ -673,9 +711,11 @@ public class MainScreen extends Screen {
 	private String routeAllImportBuffer = "";
 	private int routeAllImportBoxX, routeAllImportBoxY, routeAllImportBoxWidth, routeAllImportBoxHeight;
 	private int routeAllExportButtonX, routeAllExportButtonY, routeAllExportButtonWidth, routeAllExportButtonHeight;
+	private long routeAllExportCooldownEndNanos = 0L;
 	private String routeRoomImportBuffer = "";
 	private int routeRoomImportBoxX, routeRoomImportBoxY, routeRoomImportBoxWidth, routeRoomImportBoxHeight;
 	private int routeRoomExportButtonX, routeRoomExportButtonY, routeRoomExportButtonWidth, routeRoomExportButtonHeight;
+	private long routeRoomExportCooldownEndNanos = 0L;
 
 	// MobHighlightFeature's custom-image-fill buttons — shared fields, same reasoning as the config
 	// export/import ones above (only one panel can ever be expanded at a time).
@@ -800,24 +840,83 @@ public class MainScreen extends Screen {
 	// Per user request ("Make Transparent theme much more transparent + add gaussian blur background"): a
 	// near-see-through panel with nothing blurred behind it just shows the raw game world under the menu
 	// text, which hurts legibility badly at the new lower TRANSPARENT_ALPHA. Rather than give Panel Theme its
-	// own separate blur pass, this reuses the existing 0-10 blur slider/pipeline (GuiAnimationsFeature +
+	// own separate blur pass, this reuses the existing blur slider/pipeline (GuiAnimationsFeature +
 	// GameRendererBlurMixin, see extractBackground's own doc comment) and simply forces it to at least this
 	// floor whenever Transparent mode is active — the user's own blur slider still wins if they've set it
 	// higher than this floor.
 	private static final int TRANSPARENT_THEME_MIN_BLUR = 4;
 
-	/** Single source of truth for how much background blur should apply this frame — combines the user's own
-	 *  GuiAnimationsFeature blur slider with a forced minimum whenever Panel Theme is set to Transparent (see
-	 *  {@link #TRANSPARENT_THEME_MIN_BLUR}'s doc comment). Used by both {@link #extractBackground} (to decide
-	 *  whether to trigger the blur pass at all) and {@code GameRendererBlurMixin} (which needs the same value
-	 *  at the real vanilla read site) so the two can never disagree. */
-	public static int effectiveBlurAmount() {
+	// Real bug found (per user report, after an earlier round tried raising this to a 0-100 raw range for
+	// smoothness — "the background blur got really strong now, its not like 10 was before... it shouldnt get
+	// blurrier, it should just have more steps between the 1-10 steps, kind of like gears on a bike"):
+	// investigated whether vanilla's real blur uniform could support fractional/finer-grained levels without
+	// changing the true max strength, and confirmed it can't — the actual value crosses from Java into the
+	// GPU uniform as a plain `int` (GlobalSettingsUniform.update's own parameter type, confirmed via
+	// decompiling the real client jar), so the rendered blur can only ever take on as many distinct levels as
+	// the real integer range spans; raising that range to 0-100 was the only way to get more steps, but it
+	// did so by making the real max blur 10x stronger, exactly the unwanted side effect reported. Reverted
+	// back to the plain 0-10 range the slider itself already uses (same real strength as before either round
+	// of blur changes) — the actual fix for "looks choppy/instant" turned out to be the animation CURVE, not
+	// the number of steps (see blurFadeCurrent's own doc comment) — 11 real levels spread evenly across a real
+	// half-second by a proper time-based fade is already well beyond what a human eye resolves as distinct
+	// steps for a one-directional, monotonic change.
+	/** The blur level this screen is chasing toward right now, in the slider's own 0-10 UI units — the user's
+	 *  own GuiAnimationsFeature blur slider, combined with a forced minimum whenever Panel Theme is set to
+	 *  Transparent (see {@link #TRANSPARENT_THEME_MIN_BLUR}'s doc comment), or 0 while this screen is closing
+	 *  (see {@link #blurFadeCurrent}'s own doc comment). Kept separate from {@link #effectiveBlurAmount()} —
+	 *  this is the destination the fade chases, not the animated in-between value actually rendered this
+	 *  frame. */
+	private int targetBlurAmount() {
+		if (closing) return 0;
+		return configuredBlurAmount();
+	}
+
+	/** The player's blur slider, with Transparent theme's forced minimum — shared with the Player Viewer. */
+	public static int configuredBlurAmount() {
 		int level = FeatureRegistry.get("gui_animations") instanceof GuiAnimationsFeature gaf ? gaf.getBlurAmount() : 0;
 		if (FeatureRegistry.get("panel_theme") instanceof com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature ptf
 				&& ptf.getMode() == com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode.TRANSPARENT) {
 			level = Math.max(level, TRANSPARENT_THEME_MIN_BLUR);
 		}
 		return level;
+	}
+
+	/** Advances {@link #blurFadeCurrent} toward {@link #targetBlurAmount()} — called once per frame from
+	 *  {@link #extractRenderState}. Restarts the fade timer (from whatever value was actually showing this
+	 *  instant, not from scratch — no jump) whenever the target changes, the same "always safe to retarget
+	 *  mid-flight" guarantee {@link Anim} gives every other animated value in this screen. */
+	private void updateBlurFade(long nowNanos, float openDurationSeconds) {
+		int target = targetBlurAmount();
+		if (target != blurFadeTarget) {
+			blurFadeFrom = blurFadeCurrent;
+			blurFadeTarget = target;
+			blurFadeStartNanos = nowNanos;
+			blurFadeDurationSeconds = closing ? closeDurationSeconds : openDurationSeconds;
+		}
+		if (Anim.isGlobalInstant() || blurFadeDurationSeconds <= 0.001f) {
+			blurFadeCurrent = target;
+			return;
+		}
+		float elapsed = (nowNanos - blurFadeStartNanos) / 1_000_000_000f;
+		float t = Math.max(0f, Math.min(1f, elapsed / blurFadeDurationSeconds));
+		float eased = t * t * (3f - 2f * t); // smoothstep: slow-fast-slow, unlike Anim's always-front-loaded exponential decay
+		blurFadeCurrent = blurFadeFrom + (target - blurFadeFrom) * eased;
+	}
+
+	/** Single source of truth for how much background blur should apply THIS FRAME, in the slider's own 0-10
+	 *  UI units — {@link #blurFadeCurrent}'s current, faded value, rounded to the nearest whole unit (a
+	 *  fractional radius isn't a real vanilla concept, so the fade only ever reads as smooth across however
+	 *  many of those 11 discrete steps the target actually spans — the best this can do within the engine's
+	 *  own real capability, and per {@link #updateBlurFade}'s own doc comment, already enough steps that a
+	 *  proper time-based fade curve reads as genuinely smooth). Used by both {@link #extractBackground} (to
+	 *  decide whether to trigger the blur pass at all) and {@code GameRendererBlurMixin} (which needs the same
+	 *  value at the real vanilla read site) so the two can never disagree. Not static — {@link
+	 *  #blurFadeCurrent} is a real per-screen-instance fade, not a stateless combination of other features'
+	 *  settings — so {@code GameRendererBlurMixin} binds the live {@code MainScreen} instance instead of
+	 *  calling this as a bare type-qualified method. */
+	@Override
+	public int effectiveBlurAmount() {
+		return Math.max(0, Math.min(10, Math.round(blurFadeCurrent)));
 	}
 
 	/**
@@ -842,6 +941,25 @@ public class MainScreen extends Screen {
 			this.extractBlurredBackground(graphics);
 		}
 		this.extractTransparentBackground(graphics);
+		// Background bubbles: fade/expand with the open animation, shrink away with the close.
+		float bubbleOpen;
+		if (closing) {
+			bubbleOpen = RenderUtil.clamp01(currentScale);
+		} else {
+			float openSecs = FeatureRegistry.get("gui_animations") instanceof GuiAnimationsFeature g ? g.getOpenDuration() : 0.5f;
+			float t = openSecs <= 0.001f ? 1f : RenderUtil.clamp01((System.nanoTime() - bubblesOpenNanos) / 1e9f / openSecs);
+			bubbleOpen = 1f - (float) Math.pow(1f - t, 3);
+		}
+		this.bubbleOpen = bubbleOpen;
+	}
+
+	private final long bubblesOpenNanos = System.nanoTime();
+	private float bubbleOpen = 0f;
+
+	/** Background bubbles over the panel body's own fill, clipped to one section's rect (sidebar / content). */
+	private void drawPanelBubbles(GuiGraphicsExtractor graphics, int clipX0, int clipY0, int clipX1, int clipY1) {
+		GuiBubbles.render(graphics, panelX, panelY + HEADER_HEIGHT, panelX + panelWidth, panelY + panelHeight,
+			clipX0, clipY0, clipX1, clipY1, bubbleOpen);
 	}
 
 	@Override
@@ -859,13 +977,14 @@ public class MainScreen extends Screen {
 			searchAnim.setDurationSeconds(gaf.getSearchDuration());
 			expandProgress.setDurationSeconds(gaf.getExpandDuration());
 			closeDurationSeconds = gaf.getCloseDuration();
-			// Half for fading the old modules out, half for fading the new ones in.
-			contentSwapFadeAnim.setDurationSeconds(gaf.getContentSwitchDuration() / 2f);
 			float revealPhaseDuration = gaf.getOpenDuration() / 3f;
 			menuOpenHeaderAnim.setDurationSeconds(revealPhaseDuration);
 			menuOpenSidebarAnim.setDurationSeconds(revealPhaseDuration);
 			menuOpenContentAnim.setDurationSeconds(revealPhaseDuration);
 		}
+		// Fades toward 0 over the Closing slider's own duration while closing, or toward the real target blur
+		// level over the Opening slider's duration otherwise — see updateBlurFade's own doc comment.
+		updateBlurFade(now, gaf != null ? gaf.getOpenDuration() : 0.5f);
 		previousScale = currentScale;
 
 		if (closing) {
@@ -922,6 +1041,8 @@ public class MainScreen extends Screen {
 
 		drawPendingTooltip(graphics);
 		drawHypixelModApiWarning(graphics);
+		// NotificationToastZOrderMixin now draws this at the tail of every screen's own render (this one
+		// included), so it's no longer called here directly — see that mixin's own doc comment.
 	}
 
 	private void updateExpandState(float dt) {
@@ -1256,6 +1377,7 @@ public class MainScreen extends Screen {
 			case com.cokelord.skyblocksimplified.feature.impl.HideDamageSplashesFeature hdsf ->
 				new String[]{"Only Near Slayer Bosses", "Only Near Dungeon Bosses"};
 			case com.cokelord.skyblocksimplified.feature.impl.HideFireFeature hff -> new String[]{"Hide Fire On Entities Aswell"};
+			case com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature cmff -> new String[]{"Font", "Replace Minecraft Font Globally"};
 			case com.cokelord.skyblocksimplified.feature.impl.HideNametagsFeature hntf -> new String[]{"Only In Dungeons"};
 			case com.cokelord.skyblocksimplified.feature.impl.MoongladeBeaconAlertFeature mbaf ->
 				new String[]{"Moonglade Beacon Solver", "Solver Highlight Color"};
@@ -1277,18 +1399,21 @@ public class MainScreen extends Screen {
 			case CroesusFeature cf -> new String[]{"Highlight Profitable", "Hide Opened Chests", "Best Chest Color", "2nd Best Chest Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.HighlightPartiesFeature hpf -> new String[]{"Highlight Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.SecretsCounterFeature scf -> new String[]{"Hide Vanilla Action Bar", "Compact Mode", "Text Color"};
+			case com.cokelord.skyblocksimplified.feature.impl.ShowKuudraArmorStacksFeature ksf -> new String[]{"Compact Mode", "Text Color"};
+			case com.cokelord.skyblocksimplified.feature.impl.MinibossNotificationFeature mnbf -> new String[]{"Sound"};
 			case com.cokelord.skyblocksimplified.feature.impl.ChatDeclutterFeature declutter -> new String[]{"Hide Obtaining Messages",
 				"Keys and Doors", "Hide duped class stats message", "Hide solo class buffed stats message", "Hide Fairy Dialogue message",
 				"Hide Boss Messages", "Hide Blessing Messages", "Hide Keys", "Hide Grandma Wolf Combo Messages", "Hide Ultimate Ready Message",
 				"Remove Rewards Message", "Remove Event Rewards Message", "Remove Profile Message", "Hide Lowballers", "Hide Guild EXP Gain",
-				"Hide Sell Messages", "Hide Healer Orb Messages", "Rare Reward Hider"};
+				"Hide Sell Messages", "Hide Healer Orb Messages", "Rare Reward Hider", "Hide Teleporting Messages",
+				"Hide Revive Messages", "Hide Wither Essence Messages", "Hide Autopet Messages"};
 			case com.cokelord.skyblocksimplified.feature.impl.DisableEndermanDeathAnimationFeature dedaf -> new String[]{"Disable Dying Sound", "Disable Teleport Sound"};
 			case com.cokelord.skyblocksimplified.feature.impl.ItemAnimationsFeature iaf -> new String[]{"X Offset", "Y Offset", "Z Offset",
 				"Yaw", "Pitch", "Roll", "Size", "Disable Full Swing Animation", "In Place Swing Animation", "Swing Speed",
 				"Disable Item Swapping Animation", "Disable Hand Swaying"};
 			case ItemPickupLogFeature iplf -> new String[]{"Compact Lines", "Compact Numbers", "Expire after (s)"};
-			case GuiAnimationsFeature gaf -> new String[]{"Opening", "Closing", "Module opening", "Search bar", "Category switch",
-				"Background blur", "Cog spin on hover", "Slider animation", "Smooth scrolling"};
+			case GuiAnimationsFeature gaf -> new String[]{"Opening", "Closing", "Module opening", "Search bar",
+				"Background blur", "Cog spin on hover", "Slider animation", "Smooth scrolling", "Background bubbles"};
 			case GuiColorFeature gcf -> new String[]{"Accent Color", "Chroma", "Chroma Saturation", "Chroma Speed"};
 			case com.cokelord.skyblocksimplified.feature.impl.TerminalSolverFeature tsf -> new String[]{"Custom Terminal GUI",
 				"Block Wrong Clicks", "Middle Click Redirect", "Click Animations", "GUI Scale", "First Click Protection",
@@ -1328,9 +1453,10 @@ public class MainScreen extends Screen {
 			case com.cokelord.skyblocksimplified.feature.impl.CatacombsExpCalculatorFeature cef -> new String[]{"Catacombs Expert Ring",
 				"Derpy Mayor", "Hecatomb Level", "Bonzo's Shard Level", "Floor", "Target Catacombs Level",
 				"Include First-30-Minutes Boost", "Average Run Length"};
-			case com.cokelord.skyblocksimplified.feature.impl.DungeonTimersFeature dtmf -> new String[]{"Storm Purple Pad Timer",
-				"Terminals Timer", "Goldor Start Timer", "Goldor Early-Enter Loop", "Goldor Loop Style", "Necron Drop Timer",
-				"Maxor Crystal Timer", "Bold Text", "Italic Text", "Storm Lightning Sync"};
+			case com.cokelord.skyblocksimplified.feature.impl.DungeonTimersFeature dtmf -> new String[]{"Bold Text", "Italic Text",
+				"Storm Purple Pad Timer", "Terminals Timer", "Goldor Start Timer", "Goldor Early-Enter Loop", "Goldor Loop Style",
+				"Necron Drop Timer", "Relic Timer", "Maxor Crystal Timer", "Storm Lightning Sync", "Storm Pad Tick Timer",
+				"Terracotta Respawn Timers", "Terracotta Spawn Timer", "Last Breath Timer (Storm)", "Last Breath Box Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature dcf -> new String[]{"Edit Mode",
 				"Show All Steps", "Show Coordinates", "Waypoint Tracer", "Waypoint Beacon Line", "Title Update Sound", "Sound",
 				"Hide Title Background", "Bold Title", "Italic Title"};
@@ -1344,7 +1470,7 @@ public class MainScreen extends Screen {
 				"Party Commands", "Guild Commands", "Private Commands", "!coords", "!boop", "!cf (coinflip)", "!8ball",
 				"!dice", "!racism", "!ping", "!fps", "!time", "!location", "!holding", "!warp (party)",
 				"!allinvite (party)", "!pt / transfer (party)", "!promote (party)", "!demote (party)", "!kick (party)",
-				"!kickoffline (party)", "!downtime / !undowntime (party)", "!reinvite (party)",
+				"!kickoffline (party)", "!downtime / !undowntime (party)", "Diana Party Commands (party)", "!reinvite (party)",
 				"!f1-f7/!m1-m7/!t1-t5 (party)", "!invite (private)", "Auto Confirm Invite (private)"};
 			case com.cokelord.skyblocksimplified.feature.impl.InvincibilityTimerFeature itf -> new String[]{"Show Spirit Mask",
 				"Show Bonzo's Mask", "Show Phoenix Pet", "Alert (chat + sound)", "Announce to Party", "Only in Dungeons",
@@ -1407,7 +1533,7 @@ public class MainScreen extends Screen {
 			case com.cokelord.skyblocksimplified.feature.impl.KeyHighlightFeature khf -> new String[]{"Render mode",
 				"Fill Opacity", "Tracer", "Occlusion (hide behind walls)", "Wither Key Color", "Blood Key Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.BloodCampFeature bcf -> new String[]{"Move Prediction",
-				"Announce Move Time", "\"Kill Mobs\" Title", "Watcher Mobs Left Counter", "Predict Spawn Location", "Blood Mob Spawn Tracers",
+				"Announce Move Time", "Watcher Speed Title", "Announce Watcher Speed", "Watcher Speed Sound", "\"Kill Mobs\" Title", "Watcher Mobs Left Counter", "Predict Spawn Location", "Blood Mob Spawn Tracers",
 				"Show Time Left Until Spawn", "Render mode", "Occlusion (hide behind walls)", "Auto Ping Offset", "Box Size",
 				"Assume Tick", "Timing Offset (ms)", "Manual Offset (ms)", "Position Color", "Spawn Color", "Final (Ready) Color"};
 			case ActiveHotfPerksHighlightFeature ahpf -> new String[]{"Highlight Color"};
@@ -1427,17 +1553,19 @@ public class MainScreen extends Screen {
 			case com.cokelord.skyblocksimplified.feature.impl.SplitsFeature spf -> new String[]{"Fixed Width", "Boss Entry Split",
 				"Send Splits to Chat", "Outline", "Split Location", "Outline Thickness", "Outline Color", "Background Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.AuctionHouseTotalFeature ahtf -> new String[]{"Show \"If Sold\" Total"};
+			case com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf -> new String[]{"Update Ready Notification",
+				"Export Successful Notification", "Import Successful Notification", "Sound", "Volume", "Pitch"};
 			case com.cokelord.skyblocksimplified.feature.impl.AuctionTimersFeature atmf -> new String[]{"Bold", "Italic", "Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.ExperimentationTimersFeature etf -> new String[]{"Notify Only at 3",
 				"Notify Chat", "Notify Sound", "Notify Title"};
 			case com.cokelord.skyblocksimplified.feature.impl.ArrowAlignFeature aaf -> new String[]{"Predevice Support"};
 			case com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature ptf -> new String[]{"Panel Theme",
-				"Custom", "Gradient", "Opacity", "Accent Color"};
+				"Accent Color"};
 			case com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature ptgf -> new String[]{
-				"Reduce Item Rarity Background Updates", "Door Highlight", "Blood Camp", "Dungeon Map"};
+				"Reduce Item Rarity Background Updates", "Throttle Hide Nametags Scan", "Throttle Maxor Detection Scan"};
 			case com.cokelord.skyblocksimplified.feature.impl.PositionalMessagesFeature pmf -> new String[]{"Only in Floor 7 Bossfight",
 				"Show Position Boxes", "Circle Instead of Square", "Show Text", "Depth Check", "Wall Height", "Box Color"};
-			default -> null;
+			default -> genericSettingLabels(target);
 		};
 		if (labels == null) return false;
 		for (String label : labels) {
@@ -1766,7 +1894,7 @@ public class MainScreen extends Screen {
 		double relX = mouseX - fieldTextX;
 		if (relX <= 0) return 0;
 		for (int i = 0; i <= text.length(); i++) {
-			if (this.font.width(text.substring(0, i)) >= relX) return i;
+			if (this.textWidth(text.substring(0, i)) >= relX) return i;
 		}
 		return text.length();
 	}
@@ -1814,6 +1942,8 @@ public class MainScreen extends Screen {
 
 	private float expandedContentHeight(Feature feature) {
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.LinkedFeatureMirror mirror) feature = mirror.getTarget();
+		List<com.cokelord.skyblocksimplified.feature.SettingRow> genericRows = feature.getSettingRows();
+		if (!genericRows.isEmpty()) return 4 + settingRowsHeight(genericRows) + 10;
 		if (feature instanceof GuiColorFeature gcf) {
 			int chromaHeight = gcf.isChromaEnabled() ? 18 + 20 * 2 : 18;
 			return 18 /* Accent Presets row */ + 10 + COLOR_CONTENT_HEIGHT + 8 + chromaHeight;
@@ -1886,7 +2016,7 @@ public class MainScreen extends Screen {
 			// +18 for the shared "High Update Rate" toggle, drawn right after Tracers. LividFinderFeature (now
 			// a MobHighlightFeature subclass — see that class's own doc comment) adds its own extra "Hide
 			// Wrong Livids" toggle row at the end of the panel, same +18+6 the old dedicated branch used.
-			return 4 + 18 + 20 + (is3D ? 18 : 0) + 18 + 18 + (mhf.isTracersEnabled() ? 40 : 0)
+			return 4 + 18 + 20 + (is3D ? 18 : 0) + 18 + 18 + (mhf.getSlayerType() != null ? 18 : 0) + (mhf.isTracersEnabled() ? 40 : 0)
 				+ ((full || isFull3D) ? 20 : 0) + (full ? 18 : 0) + customImageHeight
 				+ 4 + 10 + COLOR_CONTENT_HEIGHT + ((full || isFull3D) ? 8 + 10 + COLOR_CONTENT_HEIGHT : 0)
 				+ (mhf instanceof LividFinderFeature ? 18 + 6 + 18 : 0);
@@ -1941,7 +2071,7 @@ public class MainScreen extends Screen {
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ChatDeclutterFeature) {
 			// "Hide Oruo Messages" moved to Dungeon De-clutter (dungeon-specific voice-line spam); "Hide Sell
 			// Messages"/"Hide Healer Orb Messages"/"Rare Reward Hider" added per user request — eighteen rows now.
-			return 18 * 18 + 16 /* eighteen toggles + padding */;
+			return 18 * 22 + 16 /* twenty-two toggles + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DisableEndermanDeathAnimationFeature) {
 			return 18 * 2 + 12 /* two toggles + padding */;
@@ -1963,6 +2093,12 @@ public class MainScreen extends Screen {
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.SecretsCounterFeature) {
 			return 18 * 2 + 8 + 10 + COLOR_CONTENT_HEIGHT + 12 /* two toggles + labeled full color picker + padding */;
+		}
+		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ShowKuudraArmorStacksFeature) {
+			return 18 + 8 + 10 + COLOR_CONTENT_HEIGHT + 12 /* one toggle + labeled full color picker + padding */;
+		}
+		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.MinibossNotificationFeature mnbf) {
+			return expandedSoundOptionHeight(mnbf.getSound()) + 12 /* sound option block + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.HighlightPartiesFeature) {
 			return 10 + COLOR_CONTENT_HEIGHT + 12 /* one labeled full color picker + padding */;
@@ -1991,7 +2127,7 @@ public class MainScreen extends Screen {
 				   opt-in setting left to draw a row for) + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ChatCommandsFeature) {
-			return 4 + 27 * 18 + 3 * 6 + 8 /* 27 command/channel toggles across 4 groups + padding */;
+			return 4 + 28 * 18 + 3 * 6 + 8 /* 28 command/channel toggles across 4 groups + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.InvincibilityTimerFeature) {
 			return 4 + 8 * 18 + 6 + 8 /* 3 item toggles + 5 toggles + one gap + padding */;
@@ -2089,7 +2225,8 @@ public class MainScreen extends Screen {
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.BloodCampFeature bcfHeight) {
 			boolean bcfIs3D = bcfHeight.getRenderMode() == MobHighlightFeature.RenderMode.WIRE_3D
 				|| bcfHeight.getRenderMode() == MobHighlightFeature.RenderMode.FULL_3D;
-			return 18 * 9 + (bcfIs3D ? 18 : 0) + 20 * 4 + (10 + COLOR_CONTENT_HEIGHT + 8) * 3 + 20
+			return 18 * 12 + (bcfHeight.isWatcherSpeedSoundEnabled() ? expandedSoundOptionHeight(bcfHeight.getWatcherSpeedSound()) : 0)
+				+ (bcfIs3D ? 18 : 0) + 20 * 4 + (10 + COLOR_CONTENT_HEIGHT + 8) * 3 + 20
 				/* 8 toggles (incl. Watcher Mobs Left Counter) + render-mode cycle row (+1 Occlusion toggle
 				 * only in a 3D mode) + 4 sliders (box size/assume-tick/offset/manual-offset) + 3 labeled
 				 * color pickers + padding */;
@@ -2099,6 +2236,12 @@ public class MainScreen extends Screen {
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.HideDamageSplashesFeature) {
 			return 18 * 2 + 12 /* two toggles + padding */;
+		}
+		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature cmff) {
+			// Per user request: a third row (font size slider) only shows up while Replace Minecraft Font
+			// Globally is on, since that's the only thing it sizes.
+			int rows = cmff.isReplaceMinecraftFontGlobally() ? 3 : 2;
+			return 18 * rows + 12;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DamageTruncatorFeature) {
 			return 18 + 8 /* decimals slider + padding */;
@@ -2189,10 +2332,10 @@ public class MainScreen extends Screen {
 				+ 6 /* gap before result block */ + resultBlock + 12;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonTimersFeature dtf) {
-			int goldorStyleRow = dtf.isGoldorLoopEnabled() ? 18 : 0;
-			return 18 * 9 + goldorStyleRow + 12
-				/* storm pad / terminals / goldor-start / goldor-loop / necron-warning / maxor-crystal / bold-text /
-				   italic-text / storm-lightning-sync toggles + conditional goldor-style cycle + padding */;
+			// Keep in sync with the DungeonTimersFeature branch of drawExpandedSettings — one 18px row per
+			// toggle (12) plus the conditional Goldor Loop Style cycle row, plus padding.
+			return 18 * 14 + (dtf.isGoldorLoopEnabled() ? 18 : 0)
+				+ (dtf.isLastBreathTimerEnabled() ? swatchRowHeight("dtimers_last_breath_box") : 0) + 12;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature dcf) {
 			int itemCount = dcf.getItemsForClass(selectedCopilotClass).size();
@@ -2279,6 +2422,10 @@ public class MainScreen extends Screen {
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.AuctionHouseTotalFeature) {
 			return 18 + 12 /* one toggle + padding */;
 		}
+		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf) {
+			return 18 * 3 + 4 + expandedSoundOptionHeight(mnf.getSound()) + 12
+				/* update-ready / export-successful / import-successful toggles + gap + sound option block + padding */;
+		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.AuctionTimersFeature) {
 			return 18 * 2 + 8 + 10 + COLOR_CONTENT_HEIGHT + 12
 				/* bold/italic toggles, then gap + color label + full color picker + padding */;
@@ -2342,7 +2489,7 @@ public class MainScreen extends Screen {
 			return 20 + 18 + 18 + 12 /* columns slider + size cycle + show-background toggle + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature) {
-			return 18 * 4 + 12 /* one real throttle row + three quick-access mirror rows + padding */;
+			return 18 * 3 + 12 /* one free throttle row + two tradeoff throttle rows + padding */;
 		}
 		if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.CustomLoadoutKeybindsFeature clkf) {
 			int colorRow = clkf.isHighlightSelectedLoadout() ? (10 + COLOR_CONTENT_HEIGHT + 8) : 0;
@@ -2464,19 +2611,61 @@ public class MainScreen extends Screen {
 		}
 	}
 
-	/** A true circle (standard row-by-row circle rasterization), not the corner-inset approximation
-	 *  fillRounded uses — that one reads as slightly chunky/octagonal at small sizes like the close
-	 *  button. Use this wherever something should look like an actual circle: close button, magnifier,
-	 *  toggle knobs. */
+	/** A true circle — use wherever something should look like an actual circle: close button, magnifier,
+	 *  toggle knobs. Per user request ("make the dots in the toggles a perfect circle now that we have the
+	 *  rendering tool for it"): this used to be its own separate hard-edged per-scanline rasterizer (see
+	 *  {@link RenderUtil#fillCircle}'s own doc comment for why that reads as a visible staircase) — now just
+	 *  delegates to the same smooth, supersampled-and-cached true-circle path every other circle in the menu
+	 *  already uses. */
 	private void fillCircle(GuiGraphicsExtractor graphics, int cx, int cy, int radius, int color) {
-		for (int dy = -radius; dy < radius; dy++) {
-			double yMid = dy + 0.5;
-			double halfWidth = Math.sqrt(Math.max(0.0, (double) radius * radius - yMid * yMid));
-			int rowY = cy + dy;
-			int x0 = (int) Math.round(cx - halfWidth);
-			int x1 = (int) Math.round(cx + halfWidth);
-			if (x1 > x0) graphics.fill(x0, rowY, x1, rowY + 1, color);
+		RenderUtil.fillCircle(graphics, cx, cy, radius, color);
+	}
+
+	/** Per user request ("The pixels are still really visible, i would suggest the rewrite... So go ahead
+	 *  and do that"): drop-in replacement for every {@code this.text(graphics, str, x, y, color)} call
+	 *  in this screen — mechanically swapped in via find/replace, same shape as the {@link #fillCircle}/
+	 *  {@link #fillRounded} wrappers above delegating to a shared implementation. Routes through
+	 *  {@link MsdfFont#draw} while {@link CustomMenuFontFeature} is on, vanilla otherwise, so toggling that
+	 *  feature off instantly reverts every single one of these back to plain Minecraft rendering with zero
+	 *  per-call-site logic. Per user report ("buttons in the mod menu that have symbols dont work with the
+	 *  font, like the play sound button for example"): also falls back to vanilla, even while the custom
+	 *  font is on, whenever {@link MsdfFont#supportsAllGlyphs} says the string has a character (e.g. "▶")
+	 *  the bundled MSDF atlas has no glyph for — that atlas has no per-glyph fallback of its own, unlike the
+	 *  "Replace Minecraft Font Globally" TTF path, so left unhandled that button would just silently render
+	 *  as an empty gap instead of falling through to a font that actually has the symbol. */
+	private void text(GuiGraphicsExtractor graphics, String str, int x, int y, int color) {
+		if (isCustomMenuFontActive() && MsdfFont.supportsAllGlyphs(str)) {
+			// Dozens of call sites across this screen vertically center text in a row/box with
+			// "rowY + (rowHeight - 8) / 2", hardcoded against vanilla's own ~8px glyph height. MsdfFont's
+			// line height is deliberately taller than that (see MsdfFont's own TARGET_LINE_HEIGHT doc comment),
+			// so drawing at the same y those formulas computed would extend further past their intended
+			// vertical center than an 8px-tall vanilla glyph would have -- shifting up by half that extra
+			// height re-centers it without having to touch every one of those call sites individually.
+			MsdfFont.draw(graphics, str, x, y - (MsdfFont.lineHeight() - 8) / 2f, color);
+		} else {
+			graphics.text(this.font, str, x, y, color);
 		}
+	}
+
+	/** The one real call site that draws a styled {@link net.minecraft.network.chat.Component} instead of a
+	 *  plain string (the panel title) — kept on vanilla rendering; {@link MsdfFont} only ever measures/draws
+	 *  plain strings, and a single always-vanilla title is a reasonable place to draw that line rather than
+	 *  teaching the new renderer a Style-aware path for one caller. */
+	private void text(GuiGraphicsExtractor graphics, net.minecraft.network.chat.Component component, int x, int y, int color) {
+		graphics.text(this.font, component, x, y, color);
+	}
+
+	/** Drop-in replacement for every {@code this.textWidth(str)} call in this screen — see {@link #text}'s
+	 *  own doc comment; measuring through the exact same {@link MsdfFont#width} the draw call above uses is
+	 *  what keeps centering/right-aligned layout correct once the custom font is active (a separate/
+	 *  inconsistent measurement path was the actual root cause of the old, removed Java2D renderer's own
+	 *  "REALLY scuffed" positioning bug — see {@code MsdfFont}'s own class doc comment). */
+	private int textWidth(String str) {
+		return isCustomMenuFontActive() && MsdfFont.supportsAllGlyphs(str) ? MsdfFont.width(str) : this.font.width(str);
+	}
+
+	private boolean isCustomMenuFontActive() {
+		return com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature.isMenuFontActive();
 	}
 
 	private static Boolean hypixelModApiInstalled = null;
@@ -2498,7 +2687,7 @@ public class MainScreen extends Screen {
 		// sides, so it reads as a real alert rather than one more small status line easy to skim past.
 		String text = "⚠ Hypixel Mod API is required for most features, please install it. ⚠";
 		float scale = 1.6f;
-		int textWidth = Math.round(this.font.width(text) * scale);
+		int textWidth = Math.round(this.textWidth(text) * scale);
 		int boxX0 = this.width / 2 - textWidth / 2 - 14;
 		int boxX1 = this.width / 2 + textWidth / 2 + 14;
 		int boxY0 = 6;
@@ -2509,7 +2698,7 @@ public class MainScreen extends Screen {
 		pose.pushMatrix();
 		pose.translate(this.width / 2f - textWidth / 2f, boxY0 + 6);
 		pose.scale(scale);
-		graphics.text(this.font, net.minecraft.network.chat.Component.literal(text)
+		this.text(graphics, net.minecraft.network.chat.Component.literal(text)
 			.withStyle(net.minecraft.network.chat.Style.EMPTY.withBold(true)), 0, 0, 0xFFFFFFFF);
 		pose.popMatrix();
 	}
@@ -2662,10 +2851,10 @@ public class MainScreen extends Screen {
 				graphics.enableScissor(searchX, searchY, searchRight, searchY + searchHeight);
 				boolean searchFocused = textFocus == TextFocus.SEARCH;
 				if (searchFocused) drawSelectionHighlight(graphics, searchQuery, searchX + 4, searchY + 2, searchHeight - 4);
-				graphics.text(this.font, searchQuery, searchX + 4, searchY + 4, Theme.text(0xFFBBBBBB));
+				this.text(graphics, searchQuery, searchX + 4, searchY + 4, Theme.text(0xFFBBBBBB));
 				if (searchFocused && isCaretBlinkOn()) {
 					int idx = Math.max(0, Math.min(textCursor, searchQuery.length()));
-					int caretX = searchX + 4 + this.font.width(searchQuery.substring(0, idx)) + 1;
+					int caretX = searchX + 4 + this.textWidth(searchQuery.substring(0, idx)) + 1;
 					graphics.fill(caretX, searchY + 3, caretX + 1, searchY + searchHeight - 3, 0xFFFFFFFF);
 				}
 				graphics.disableScissor();
@@ -2712,12 +2901,13 @@ public class MainScreen extends Screen {
 			fillPanelBackground(graphics, sidebarX, sidebarTop, sidebarX + SIDEBAR_WIDTH, sidebarBottom, PANEL_RADIUS, false, false, true, false,
 				panelX, panelX + panelWidth);
 		}
+		drawPanelBubbles(graphics, sidebarX, sidebarTop, sidebarX + SIDEBAR_WIDTH, sidebarRevealBottom);
 		int catY = sidebarTop + 12 - Math.round(sidebarScrollAnim.get());
 		for (FeatureCategory category : allCategories) {
 			Anim hoverAnim = hoverAnims.computeIfAbsent(category, c -> new Anim(0f, HOVER_DURATION));
 			int px = sidebarX + 16;
 			int py = catY;
-			int textWidth = this.font.width(category.getDisplayName());
+			int textWidth = this.textWidth(category.getDisplayName());
 			boolean isHoveringText = interactive && mouseX >= px && mouseX <= px + textWidth
 				&& mouseY >= catY - 4 && mouseY <= catY - 4 + 16;
 			boolean big = isHoveringText || category == selectedCategory;
@@ -2767,6 +2957,7 @@ public class MainScreen extends Screen {
 			fillPanelBackground(graphics, contentX, contentY, contentX + contentWidth, contentY + contentHeight, PANEL_RADIUS, false, false, false, true,
 				panelX, panelX + panelWidth);
 		}
+		drawPanelBubbles(graphics, contentX, contentY, contentRevealRight, panelY + panelHeight);
 
 		List<String> subcats = selectedCategory.getSubcategories();
 		// Per user request ("remove the entire tile grid subcategory system, I like the buttons at the
@@ -2877,14 +3068,14 @@ public class MainScreen extends Screen {
 			if (rowVisible && drawRowContent) {
 				fillRoundedGradient(graphics, rowX, rowTop, rowX + rowWidth, rowTop + rowInnerHeight, SMALL_RADIUS,
 					colorRowBg(rowX, rowTop, rowWidth, rowInnerHeight));
-				graphics.text(this.font, feature.getDisplayName(), rowX + 8, rowTop + rowInnerHeight / 2 - 4, colorRowText());
+				this.text(graphics, feature.getDisplayName(), rowX + 8, rowTop + rowInnerHeight / 2 - 4, colorRowText());
 				// Per user request ("tooltips for every feature in the mod... hovering the module name...
 				// should show a small tooltip explaining what it does"): every feature's own getDescription()
 				// (empty by default, overridden per-feature) is shown via the same 2-second-hover tooltip
 				// mechanism already used for individual subtoggles — hovering just the label text, not the
 				// whole row, so it doesn't fight with the toggle/cog/keybind hitboxes right next to it.
 				if (feature.getDescription() != null) {
-					checkHoverTooltip(mouseX, mouseY, rowX + 8, rowTop, this.font.width(feature.getDisplayName()), rowInnerHeight,
+					checkHoverTooltip(mouseX, mouseY, rowX + 8, rowTop, this.textWidth(feature.getDisplayName()), rowInnerHeight,
 						"module_desc_" + feature.getId(), feature.getDescription());
 				}
 
@@ -2929,17 +3120,17 @@ public class MainScreen extends Screen {
 				if (!toggleable && primaryCombo != null) {
 					boolean listening = primaryCombo == listeningForCombo;
 					String label = listening ? comboCaptureLabel() : (primaryCombo.isEmpty() ? "NONE" : primaryCombo.getDisplayName());
-					slotWidth = Math.max(50, this.font.width(label) + 10);
+					slotWidth = Math.max(50, this.textWidth(label) + 10);
 				} else if (!toggleable && primaryKeybind != null) {
 					boolean listening = primaryKeybind == listeningFor;
 					String label = listening ? "press a key..." : (primaryKeybind.isUnbound() ? "NONE" : primaryKeybind.getTranslatedKeyMessage().getString());
-					slotWidth = Math.max(50, this.font.width(label) + 10);
+					slotWidth = Math.max(50, this.textWidth(label) + 10);
 				} else if (isColorSwatch) {
 					slotWidth = COLOR_SWATCH_SIZE;
 					slotHeight = COLOR_SWATCH_SIZE;
 				} else if (isUpdateButton) {
 					String label = updateState == com.cokelord.skyblocksimplified.api.UpdateApi.State.DOWNLOADING ? "Downloading..." : "Update";
-					slotWidth = this.font.width(label) + 16;
+					slotWidth = this.textWidth(label) + 16;
 					slotHeight = 16;
 				} else if (!toggleable) {
 					// Real bug found (per user report — cog sitting with a visible dead gap to its right on
@@ -2966,13 +3157,13 @@ public class MainScreen extends Screen {
 					boolean listening = primaryCombo == listeningForCombo;
 					String label = listening ? comboCaptureLabel() : (primaryCombo.isEmpty() ? "NONE" : primaryCombo.getDisplayName());
 					fillRounded(graphics, slotX, slotY, slotX + slotWidth, slotY + slotHeight, BOX_RADIUS, listening ? colorKeybindListening() : colorKeybindBox());
-					graphics.text(this.font, label, slotX + 4, slotY + 3, Theme.text(0xFFDDDDDD));
+					this.text(graphics, label, slotX + 4, slotY + 3, Theme.text(0xFFDDDDDD));
 					comboRows.add(new ComboRow(primaryCombo, slotX, slotY, slotWidth, slotHeight));
 				} else if (primaryKeybind != null) {
 					boolean listening = primaryKeybind == listeningFor;
 					String label = listening ? "press a key..." : (primaryKeybind.isUnbound() ? "NONE" : primaryKeybind.getTranslatedKeyMessage().getString());
 					fillRounded(graphics, slotX, slotY, slotX + slotWidth, slotY + slotHeight, BOX_RADIUS, listening ? colorKeybindListening() : colorKeybindBox());
-					graphics.text(this.font, label, slotX + 4, slotY + 3, Theme.text(0xFFDDDDDD));
+					this.text(graphics, label, slotX + 4, slotY + 3, Theme.text(0xFFDDDDDD));
 					inlineKeybindRows.add(new InlineKeybindRow(primaryKeybind, slotX, slotY, slotWidth, slotHeight));
 				} else if (isColorSwatch) {
 					fillRounded(graphics, slotX, slotY, slotX + slotWidth, slotY + slotHeight, SMALL_RADIUS, ((GuiColorFeature) feature).getColor());
@@ -2987,7 +3178,7 @@ public class MainScreen extends Screen {
 						fillPanelBackgroundOrGradient(graphics, slotX, slotY, slotX + slotWidth, slotY + slotHeight, BOX_RADIUS, bg, 0.12f);
 					}
 					int textColor = available || downloading ? 0xFFFFFFFF : 0xFF777777;
-					graphics.text(this.font, label, slotX + (slotWidth - this.font.width(label)) / 2, slotY + (slotHeight - 8) / 2, textColor);
+					this.text(graphics, label, slotX + (slotWidth - this.textWidth(label)) / 2, slotY + (slotHeight - 8) / 2, textColor);
 					// Per user request: no update available means this button does nothing, so it's greyed
 					// out AND has a real vanilla barrier icon drawn over its own text — same "this is inert"
 					// language RareRewardWarningFeature's Refuse Offer slot already uses elsewhere in this
@@ -3002,6 +3193,7 @@ public class MainScreen extends Screen {
 				// GUI Color has no cog: the swatch itself opens its settings, per user request.
 				Feature settingsFeature = feature instanceof com.cokelord.skyblocksimplified.feature.LinkedFeatureMirror mirror ? mirror.getTarget() : feature;
 				boolean hasSettings = !feature.getKeybinds().isEmpty()
+					|| !settingsFeature.getSettingRows().isEmpty()
 					|| settingsFeature instanceof GuiAnimationsFeature
 					|| settingsFeature instanceof CustomEnchantParsingFeature
 					|| settingsFeature instanceof MobHighlightFeature
@@ -3057,6 +3249,8 @@ public class MainScreen extends Screen {
 					// never got it added, so its entire settings panel (Render Boxes, the self-test toggle,
 					// sound options) was unreachable through the UI this whole time — not a render/detection bug.
 					|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.EarlyEnterDetectionFeature
+					|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ShowKuudraArmorStacksFeature
+					|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.MinibossNotificationFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.puzzle.WaterSolverFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.puzzle.TPMazeSolverFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.puzzle.IceFillSolverFeature
@@ -3109,6 +3303,7 @@ public class MainScreen extends Screen {
 				// expanded some other way.
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.SplitsFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.AuctionHouseTotalFeature
+				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.AuctionTimersFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ExperimentationTimersFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ArrowAlignFeature
@@ -3116,7 +3311,8 @@ public class MainScreen extends Screen {
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.PetKeybindsFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature
 				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature
-				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ModInformationFeature;
+				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.ModInformationFeature
+				|| settingsFeature instanceof com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature;
 				int cogSize = 12;
 				// Real fix (per user follow-up — "Move cog further left in Mod Information row (verify vs
 				// earlier -4px fix)": the previous -4px nudge here was a guess that turned out too small —
@@ -3201,7 +3397,7 @@ public class MainScreen extends Screen {
 			int floatY = listY + listHeight - floatSize - 10;
 			fillRounded(graphics, floatX, floatY, floatX + floatSize, floatY + floatSize, SMALL_RADIUS, accent);
 			String plus = "+";
-			graphics.text(this.font, plus, floatX + (floatSize - this.font.width(plus)) / 2, floatY + (floatSize - 8) / 2, Theme.text(0xFFFFFFFF));
+			this.text(graphics, plus, floatX + (floatSize - this.textWidth(plus)) / 2, floatY + (floatSize - 8) / 2, Theme.text(0xFFFFFFFF));
 			Runnable action = floatingAddAction;
 			clickHits.add(new ClickHit(floatX, floatY, floatSize, floatSize, action));
 		}
@@ -3241,12 +3437,12 @@ public class MainScreen extends Screen {
 		int by = y + (SUB_TAB_BAR_HEIGHT - buttonHeight) / 2;
 		String current = selectedSlayerType == null ? "General" : selectedSlayerType;
 		for (String type : SLAYER_TYPES) {
-			int textWidth = this.font.width(type);
+			int textWidth = this.textWidth(type);
 			int buttonWidth = textWidth + 14;
 			boolean selected = type.equals(current);
 			fillPanelBackgroundOrGradient(graphics, bx, by, bx + buttonWidth, by + buttonHeight, BOX_RADIUS,
 				selected ? colorSubTabSelectedBg() : colorSubTabBg(), selected ? 0f : 0.1f);
-			graphics.text(this.font, type, bx + (buttonWidth - textWidth) / 2, by + (buttonHeight - 8) / 2, accent);
+			this.text(graphics, type, bx + (buttonWidth - textWidth) / 2, by + (buttonHeight - 8) / 2, accent);
 			slayerTypeRows.add(new SubTabRow(type, bx, by, buttonWidth, buttonHeight));
 			bx += buttonWidth + 6;
 		}
@@ -3260,12 +3456,12 @@ public class MainScreen extends Screen {
 		int buttonHeight = 18;
 		int by = y + (SUB_TAB_BAR_HEIGHT - buttonHeight) / 2;
 		for (String sub : subcats) {
-			int textWidth = this.font.width(sub);
+			int textWidth = this.textWidth(sub);
 			int buttonWidth = textWidth + 14;
 			boolean selected = sub.equals(selectedSubcategory);
 			fillPanelBackgroundOrGradient(graphics, bx, by, bx + buttonWidth, by + buttonHeight, BOX_RADIUS,
 				selected ? colorSubTabSelectedBg() : colorSubTabBg(), selected ? 0f : 0.1f);
-			graphics.text(this.font, sub, bx + (buttonWidth - textWidth) / 2, by + (buttonHeight - 8) / 2, selected ? accent : Theme.text(0xFFDDDDDD));
+			this.text(graphics, sub, bx + (buttonWidth - textWidth) / 2, by + (buttonHeight - 8) / 2, selected ? accent : Theme.text(0xFFDDDDDD));
 			subTabRows.add(new SubTabRow(sub, bx, by, buttonWidth, buttonHeight));
 			bx += buttonWidth + 6;
 		}
@@ -3278,7 +3474,11 @@ public class MainScreen extends Screen {
 		if (height < SLOT_ROW_HEIGHT / 2) return;
 
 		graphics.enableScissor(x, y, x + width, y + height);
-		if (feature instanceof GuiColorFeature gcf) {
+		List<com.cokelord.skyblocksimplified.feature.SettingRow> genericRows = feature.getSettingRows();
+		if (!genericRows.isEmpty()) {
+			settingRowsWrapWidth = width - 20;
+			drawSettingRows(graphics, genericRows, x + 10, y + 4, width - 20, accent, feature.getId());
+		} else if (feature instanceof GuiColorFeature gcf) {
 			drawColorPickerContent(graphics, gcf, x, y, width, height, accent, mouseX, mouseY);
 		} else if (feature instanceof GuiAnimationsFeature gaf) {
 			drawAnimationsContent(graphics, gaf, x, y, width, height, accent);
@@ -3329,6 +3529,14 @@ public class MainScreen extends Screen {
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "High Update Rate (uses more FPS)",
 				MobHighlightFeature.isHighFrequencyPolling(), () -> { MobHighlightFeature.setHighFrequencyPolling(!MobHighlightFeature.isHighFrequencyPolling()); ConfigManager.save(); },
 				"Shared by every highlight module in the mod. On: newly-appearing or disappearing mobs get highlighted/unhighlighted faster, at the cost of some FPS. Off: slightly slower to react, but lighter on performance.");
+			if (mhf.getSlayerType() != null) {
+				rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Only My Bosses",
+					mhf.isRequireOwnBoss(), () -> { mhf.setRequireOwnBoss(!mhf.isRequireOwnBoss()); ConfigManager.save(); },
+					"Only highlights a boss spawned by you (matched against the \"Spawned by:\" nametag). Turn off if you're boss trading with someone else.");
+				rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Other's Bosses",
+					mhf.isHideOthersBosses(), () -> { mhf.setHideOthersBosses(!mhf.isHideOthersBosses()); ConfigManager.save(); },
+					"Fully hides a boss that doesn't match your own \"Spawned by:\" nametag, instead of just leaving it un-highlighted.");
+			}
 			if (mhf.isTracersEnabled()) {
 				rowY = drawSliderRow(graphics, rowX, rowY, rowWidth, "Tracer thickness", String.valueOf(mhf.getTracerThickness()),
 					(mhf.getTracerThickness() - 1) / 9f, v -> { mhf.setTracerThickness(1 + Math.round(v * 9f)); ConfigManager.save(); }, accent,
@@ -3367,7 +3575,7 @@ public class MainScreen extends Screen {
 				}
 				fillRounded(graphics, mhfImageButtonX, mhfImageButtonY, mhfImageButtonX + mhfImageButtonWidth, mhfImageButtonY + mhfImageButtonHeight, BOX_RADIUS, accent);
 				String selectLabel = hasImage ? "Change Image..." : "Select Image...";
-				graphics.text(this.font, selectLabel, mhfImageButtonX + (mhfImageButtonWidth - this.font.width(selectLabel)) / 2,
+				this.text(graphics, selectLabel, mhfImageButtonX + (mhfImageButtonWidth - this.textWidth(selectLabel)) / 2,
 					mhfImageButtonY + (mhfImageButtonHeight - 8) / 2, 0xFFFFFFFF);
 				rowY += mhfImageButtonHeight;
 				if (hasImage) {
@@ -3379,7 +3587,7 @@ public class MainScreen extends Screen {
 					fillRounded(graphics, mhfClearImageButtonX, mhfClearImageButtonY, mhfClearImageButtonX + mhfClearImageButtonWidth,
 						mhfClearImageButtonY + mhfClearImageButtonHeight, BOX_RADIUS, Theme.chrome(0xFF3A3A3A));
 					String clearLabel = "Clear Image";
-					graphics.text(this.font, clearLabel, mhfClearImageButtonX + (mhfClearImageButtonWidth - this.font.width(clearLabel)) / 2,
+					this.text(graphics, clearLabel, mhfClearImageButtonX + (mhfClearImageButtonWidth - this.textWidth(clearLabel)) / 2,
 						mhfClearImageButtonY + (mhfClearImageButtonHeight - 8) / 2, 0xFFDDDDDD);
 					rowY += mhfClearImageButtonHeight + 8;
 					// Fill mode only matters once an image actually exists to be fit/tiled — per user
@@ -3498,6 +3706,21 @@ public class MainScreen extends Screen {
 			drawSliderRow(graphics, x + 10, y + 4, width - 20, "Decimals", String.valueOf(dtf.getDecimals()),
 				dtf.getDecimals() / 4f, v -> { dtf.setDecimals(Math.round(v * 4f)); ConfigManager.save(); }, accent,
 				"How many decimal places to show on shortened damage numbers (e.g. 1.4M vs 1.42M).");
+		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature cmff) {
+			int rowY = drawCycleRow(graphics, x + 10, y + 4, width - 20, "Font", cmff.getFontChoice().displayName,
+				() -> { cmff.setFontChoice(cmff.getFontChoice().next()); ConfigManager.save(); },
+				"Cycles between the bundled fonts the mod menu and notification toasts render with.");
+			rowY = drawToggleRow(graphics, x + 10, rowY, width - 20, "Replace Minecraft Font Globally",
+				cmff.isReplaceMinecraftFontGlobally(), () -> { cmff.setReplaceMinecraftFontGlobally(!cmff.isReplaceMinecraftFontGlobally()); ConfigManager.save(); },
+				"Redirects Minecraft's own default font everywhere, not just this mod's own menu/toasts - reaches other mod GUI elements too, but also affects vanilla text like tooltips, inventory, and chat.");
+			if (cmff.isReplaceMinecraftFontGlobally()) {
+				int range = com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature.MAX_GLOBAL_FONT_SIZE
+					- com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature.MIN_GLOBAL_FONT_SIZE;
+				drawSliderRow(graphics, x + 10, rowY, width - 20, "Font Size", String.valueOf(cmff.getGlobalFontSize()),
+					(cmff.getGlobalFontSize() - com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature.MIN_GLOBAL_FONT_SIZE) / (float) range,
+					v -> { cmff.setGlobalFontSize(com.cokelord.skyblocksimplified.feature.impl.CustomMenuFontFeature.MIN_GLOBAL_FONT_SIZE + Math.round(v * range)); ConfigManager.save(); },
+					accent, "Only affects the Replace Minecraft Font Globally text size - the mod menu and notification toasts have their own fixed size.");
+			}
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.HideFireFeature hff) {
 			drawToggleRow(graphics, x + 10, y + 7, width - 20, "Hide Fire On Entities Aswell",
 				hff.isHideOnEntities(), () -> { hff.setHideOnEntities(!hff.isHideOnEntities()); ConfigManager.save(); },
@@ -3628,19 +3851,9 @@ public class MainScreen extends Screen {
 				cf.isHideOpenedRuns(), () -> { cf.setHideOpenedRuns(!cf.isHideOpenedRuns()); ConfigManager.save(); },
 				"Dims already-claimed runs in the Croesus run-history list. Turned on automatically while Chest Rolling is enabled.");
 			rowY += 6;
-			// Per user request ("please add a 'clear cache' button inside croesus that fully clears the list
-			// so i can do testing"): wipes Chest Rolling's own tracked-run list — lives here rather than on
-			// Chest Rolling's own panel since the user asked for it specifically "inside croesus."
-			int clearButtonHeight = 16;
-			fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + clearButtonHeight, SMALL_RADIUS, Theme.chrome(0xFF3A3A3A));
-			String clearRunsLabel = "Clear Tracked Runs";
-			graphics.text(this.font, clearRunsLabel, rowX + (rowWidth - this.font.width(clearRunsLabel)) / 2,
-				rowY + (clearButtonHeight - 8) / 2, Theme.text(0xFFDDDDDD));
-			clickHits.add(new ClickHit(rowX, rowY, rowWidth, clearButtonHeight, () -> {
-				var rolling = com.cokelord.skyblocksimplified.feature.impl.ChestRollingFeature.getInstance();
-				if (rolling != null) rolling.clearTrackedRuns();
-			}));
-			rowY += clearButtonHeight + 2;
+			// "Clear Tracked Runs" button removed per user request — the tracked-run list is now tied to the
+			// real current Hypixel account's own file (see ChestRollingFeature's trackedRuns doc comment), not
+			// a shared cache someone would need to blank out for testing across accounts anymore.
 			rowY += 8;
 			// Same overlap issue as BloodCampFeature's own color pickers (see its doc comment above) — shortened.
 			colorPickerLabel(graphics, rowX, rowY, "Best Chest Color");
@@ -3663,6 +3876,21 @@ public class MainScreen extends Screen {
 			colorPickerLabel(graphics, rowX, rowY, "Text Color");
 			drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "secrets_counter_color", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
 				scf::getTextColor, c -> { scf.setTextColor((scf.getTextColor() & 0xFF000000) | (c & 0xFFFFFF)); ConfigManager.save(); }, 0xFFFFFFFF);
+		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ShowKuudraArmorStacksFeature ksf) {
+			int rowX = x + 10;
+			int rowWidth = width - 20;
+			int rowY = drawToggleRow(graphics, rowX, y + 4, rowWidth, "Compact Mode",
+				ksf.isCompactMode(), () -> { ksf.setCompactMode(!ksf.isCompactMode()); ConfigManager.save(); },
+				"Shows a smaller, more condensed version of the readout.");
+			rowY += 8;
+			colorPickerLabel(graphics, rowX, rowY, "Text Color");
+			drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "kuudra_armor_stacks_color", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
+				ksf::getTextColor, c -> { ksf.setTextColor((ksf.getTextColor() & 0xFF000000) | (c & 0xFFFFFF)); ConfigManager.save(); }, 0xFFFFAA00);
+		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.MinibossNotificationFeature mnbf) {
+			int rowX = x + 10;
+			int rowWidth = width - 20;
+			int rowY = y + 4;
+			drawSoundOptionRows(graphics, rowX, rowY, rowWidth, accent, mnbf.getSound());
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.HighlightPartiesFeature hpf) {
 			int rowX = x + 10;
 			int rowWidth = width - 20;
@@ -3758,7 +3986,7 @@ public class MainScreen extends Screen {
 			rowY += 4;
 			// Per user request: color-code support in title text ('&'/'§' both work) and a "(username)"
 			// placeholder for the notifications that have a detected sender (Early Enter, Healer at SS, etc.).
-			graphics.text(this.font, "§7Titles support &7/§7 codes and (username)", rowX, rowY, Theme.text(0xFF888888));
+			this.text(graphics, "§7Titles support &7/§7 codes and (username)", rowX, rowY, Theme.text(0xFF888888));
 			rowY += 12;
 			rowY += 8;
 			// Per follow-up request ("theres currently a hex picker in dungeon notifications, for the title
@@ -3954,9 +4182,21 @@ public class MainScreen extends Screen {
 					dmf.isMapInfoShowMimic(), () -> { dmf.setMapInfoShowMimic(!dmf.isMapInfoShowMimic()); ConfigManager.save(); });
 				rowY += 8;
 				colorPickerLabel(graphics, rowX, rowY, "Map Info Text Color");
-				drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "dungeon_map_info_text", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
+				// Real bug found (per user report — "Parse map websocket subtoggle inside dungeon map module is
+				// baked over the hex picker for map info text color"): this call's return value (the real Y
+				// position right after the picker's own hex-input row, well below its gradient square/sliders)
+				// used to be discarded, so rowY still held whatever value colorPickerLabel above left it at —
+				// the toggle below then rendered using that stale, far-too-small Y and landed on top of the
+				// picker instead of after it.
+				rowY = drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "dungeon_map_info_text", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
 					dmf::getMapInfoTextColor, c -> { dmf.setMapInfoTextColor((dmf.getMapInfoTextColor() & 0xFF000000) | (c & 0xFFFFFF)); ConfigManager.save(); }, 0xFFFFFFFF);
+				rowY += 8;
 			}
+			// Per user request ("Odin added websocket support for the dungeon map... Make it prioritize
+			// sending websocket data but if it cant find any it should fall back to our method") — matches
+			// Odin's own real "Parse map websocket" setting name/default.
+			drawToggleRow(graphics, rowX, rowY, rowWidth, "Parse Map Websocket",
+				dmf.isParseMapWebsocket(), () -> { dmf.setParseMapWebsocket(!dmf.isParseMapWebsocket()); ConfigManager.save(); });
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonScoreCalculatorFeature dscf) {
 			int rowX = x + 10;
 			int rowWidth = width - 20;
@@ -3967,7 +4207,7 @@ public class MainScreen extends Screen {
 				dscf.isAutoDetectMayorPerk(), () -> { dscf.setAutoDetectMayorPerk(!dscf.isAutoDetectMayorPerk()); ConfigManager.save(); });
 			rowY += 4;
 			String mayorNote = dscf.mayorStatusText();
-			graphics.text(this.font, mayorNote, rowX, rowY, Theme.text(0xFF888888));
+			this.text(graphics, mayorNote, rowX, rowY, Theme.text(0xFF888888));
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.CatacombsExpCalculatorFeature cef) {
 			// Called every frame the cog is open (see the feature's own doc comment on refreshStats) — request()
 			// is idempotent once cached/in-flight so this is safe unconditionally, same pattern PartyFinder uses.
@@ -3979,9 +4219,9 @@ public class MainScreen extends Screen {
 			com.cokelord.skyblocksimplified.api.SkyblockStatsApi.PlayerStats stats = cef.stats();
 			com.cokelord.skyblocksimplified.feature.impl.CatacombsExpCalculatorFeature.Result result = cef.computeResult();
 			if (stats == null || result == null) {
-				graphics.text(this.font, "Loading Hypixel API data...", rowX, rowY, Theme.text(0xFF888888));
+				this.text(graphics, "Loading Hypixel API data...", rowX, rowY, Theme.text(0xFF888888));
 			} else {
-				graphics.text(this.font, String.format("Catacombs Level %d (%,.0f / %,d XP to next)",
+				this.text(graphics, String.format("Catacombs Level %d (%,.0f / %,d XP to next)",
 					result.currentLevel(), result.currentLevelProgressXp(), result.currentLevelXpForNext()), rowX, rowY, Theme.text(0xFFDDDDDD));
 			}
 			rowY += 14;
@@ -3995,11 +4235,11 @@ public class MainScreen extends Screen {
 			rowY = drawColoredToggleRow(graphics, rowX, rowY, rowWidth, "catacombs_expert_ring", "Catacombs Expert Ring", RARITY_EPIC,
 				cef.isOwnsExpertRing(), () -> { cef.setOwnsExpertRing(!cef.isOwnsExpertRing()); ConfigManager.save(); });
 			rowY = drawCatacombsStatusLine(graphics, rowX, rowY, "Derpy Mayor (MOAR SKILLZ!!!)", RARITY_MYTHIC, cef.isDerpyXpBoostActive());
-			graphics.text(this.font, "Hecatomb Level: " + (stats != null ? stats.maxHecatombLevel() : "-"), rowX, rowY, Theme.text(0xFFFF5555));
+			this.text(graphics, "Hecatomb Level: " + (stats != null ? stats.maxHecatombLevel() : "-"), rowX, rowY, Theme.text(0xFFFF5555));
 			rowY += 14;
 			rowY += 4;
 
-			graphics.text(this.font, "Bonzo's Shard Level (0-10, blank = 0)", rowX, rowY, Theme.text(RARITY_EPIC));
+			this.text(graphics, "Bonzo's Shard Level (0-10, blank = 0)", rowX, rowY, Theme.text(RARITY_EPIC));
 			rowY = drawGenericTextField(graphics, "catacombs_bonzo_shard", rowX, rowY + 12, rowWidth, 16,
 				"0", cef::getBonzoShardInput, cef::setBonzoShardInput) + 6;
 
@@ -4007,7 +4247,7 @@ public class MainScreen extends Screen {
 				() -> { cycleCatacombsFloor(cef); ConfigManager.save(); });
 			rowY += 4;
 
-			graphics.text(this.font, "Target Catacombs Level", rowX, rowY, Theme.text(0xFFAAAAAA));
+			this.text(graphics, "Target Catacombs Level", rowX, rowY, Theme.text(0xFFAAAAAA));
 			rowY = drawGenericTextField(graphics, "catacombs_target_level", rowX, rowY + 12, rowWidth, 16,
 				"50", cef::getTargetLevelInput, cef::setTargetLevelInput) + 6;
 
@@ -4015,7 +4255,7 @@ public class MainScreen extends Screen {
 				cef.isIncludeEarlyBoost(), () -> { cef.setIncludeEarlyBoost(!cef.isIncludeEarlyBoost()); ConfigManager.save(); });
 
 			if (cef.isIncludeEarlyBoost()) {
-				graphics.text(this.font, "Average Run Length (min / sec)", rowX, rowY + 4, Theme.text(0xFFAAAAAA));
+				this.text(graphics, "Average Run Length (min / sec)", rowX, rowY + 4, Theme.text(0xFFAAAAAA));
 				int fieldGap = 6;
 				int fieldWidth = (rowWidth - fieldGap) / 2;
 				drawGenericTextField(graphics, "catacombs_run_minutes", rowX, rowY + 16, fieldWidth, 16,
@@ -4027,22 +4267,31 @@ public class MainScreen extends Screen {
 			rowY += 6;
 
 			if (result == null) {
-				graphics.text(this.font, "Waiting for Hypixel API data to load...", rowX, rowY, Theme.text(0xFF888888));
+				this.text(graphics, "Waiting for Hypixel API data to load...", rowX, rowY, Theme.text(0xFF888888));
 			} else {
-				graphics.text(this.font, String.format("Total Bonus: +%.2f%% Catacombs EXP", result.multiplierPercent()),
+				this.text(graphics, String.format("Total Bonus: +%.2f%% Catacombs EXP", result.multiplierPercent()),
 					rowX, rowY, Theme.text(accent));
 				rowY += 13;
-				graphics.text(this.font, String.format("EXP Needed: %,.0f", result.xpNeeded()), rowX, rowY, Theme.text(0xFFCCCCCC));
+				this.text(graphics, String.format("EXP Needed: %,.0f", result.xpNeeded()), rowX, rowY, Theme.text(0xFFCCCCCC));
 				rowY += 13;
-				graphics.text(this.font, String.format("EXP per Run: %,.0f normal / %,.0f early-boosted",
+				this.text(graphics, String.format("EXP per Run: %,.0f normal / %,.0f early-boosted",
 					result.xpPerNormalRun(), result.xpPerEarlyRun()), rowX, rowY, Theme.text(0xFFCCCCCC));
 				rowY += 13;
-				graphics.text(this.font, "Estimated Runs Needed: " + result.runsNeeded(), rowX, rowY, Theme.text(0xFFFFFF55));
+				this.text(graphics, "Estimated Runs Needed: " + result.runsNeeded(), rowX, rowY, Theme.text(0xFFFFFF55));
 			}
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonTimersFeature dtf) {
 			int rowX = x + 10;
 			int rowWidth = width - 20;
 			int rowY = y + 4;
+			// Per user request ("Place the bold and italic text subtoggles at the top of the module instead
+			// of in the middle"): these two apply to every plain timer line in this panel, so they read more
+			// like a shared setting up front than something buried between two unrelated timer toggles.
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Bold Text",
+				dtf.isBoldText(), () -> { dtf.setBoldText(!dtf.isBoldText()); ConfigManager.save(); },
+				"Makes the timer text bold.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Italic Text",
+				dtf.isItalicText(), () -> { dtf.setItalicText(!dtf.isItalicText()); ConfigManager.save(); },
+				"Makes the timer text italic.");
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Storm Purple Pad Timer",
 				dtf.isStormPadTimerEnabled(), () -> { dtf.setStormPadTimerEnabled(!dtf.isStormPadTimerEnabled()); ConfigManager.save(); },
 				"Countdown timer for the Storm boss's purple pad phase.");
@@ -4063,18 +4312,33 @@ public class MainScreen extends Screen {
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Necron Drop Timer",
 				dtf.isNecronWarningEnabled(), () -> { dtf.setNecronWarningEnabled(!dtf.isNecronWarningEnabled()); ConfigManager.save(); },
 				"Countdown timer warning before Necron's next lava drop.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Relic Timer",
+				dtf.isRelicTimerEnabled(), () -> { dtf.setRelicTimerEnabled(!dtf.isRelicTimerEnabled()); ConfigManager.save(); },
+				"M7: counts down 2.1s from the Cleared split until the relics spawn. Linked to the Relic Utility module (enables its altar highlight too).");
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Maxor Crystal Timer",
 				dtf.isMaxorCrystalTimerEnabled(), () -> { dtf.setMaxorCrystalTimerEnabled(!dtf.isMaxorCrystalTimerEnabled()); ConfigManager.save(); },
 				"Countdown timer for Maxor's crystal phase.");
-			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Bold Text",
-				dtf.isBoldText(), () -> { dtf.setBoldText(!dtf.isBoldText()); ConfigManager.save(); },
-				"Makes the timer text bold.");
-			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Italic Text",
-				dtf.isItalicText(), () -> { dtf.setItalicText(!dtf.isItalicText()); ConfigManager.save(); },
-				"Makes the timer text italic.");
-			drawToggleRow(graphics, rowX, rowY, rowWidth, "Storm Lightning Sync",
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Storm Lightning Sync",
 				dtf.isStormLightningSyncEnabled(), () -> { dtf.setStormLightningSyncEnabled(!dtf.isStormLightningSyncEnabled()); ConfigManager.save(); },
 				"Shows a countdown synced to Storm's lightning strikes, and hides the vanilla title for it.");
+			// Distinct from "Storm Purple Pad Timer" above, which is the one-shot "27s delay + 5s countdown"
+			// predictor for the same pad; this is the repeating 20-tick countdown.
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Storm Pad Tick Timer",
+				dtf.isStormPadTickTimerEnabled(), () -> { dtf.setStormPadTickTimerEnabled(!dtf.isStormPadTickTimerEnabled()); ConfigManager.save(); },
+				"A repeating 20-tick countdown visible during Storm's second phase, for timing the purple pad's once-per-second movement.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Terracotta Respawn Timers",
+				dtf.isTerracottaRespawnTimersEnabled(), () -> { dtf.setTerracottaRespawnTimersEnabled(!dtf.isTerracottaRespawnTimersEnabled()); ConfigManager.save(); },
+				"F6 boss: places a 12s countdown above each spot a Terracotta died, until it respawns.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Terracotta Spawn Timer",
+				dtf.isTerracottaSpawnTimerEnabled(), () -> { dtf.setTerracottaSpawnTimerEnabled(!dtf.isTerracottaSpawnTimerEnabled()); ConfigManager.save(); },
+				"F6 boss: counts down 12s from entering the boss fight until the Terracottas spawn.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Last Breath Timer (Storm)",
+				dtf.isLastBreathTimerEnabled(), () -> { dtf.setLastBreathTimerEnabled(!dtf.isLastBreathTimerEnabled()); ConfigManager.save(); },
+				"Storm: \"Draw back...\" at 29.60 on the Storm split with a 5s countdown, \"Release!\" at 34.60, plus a box on the spot to shoot.");
+			if (dtf.isLastBreathTimerEnabled()) {
+				drawColorSwatchRow(graphics, rowX, rowY, rowWidth, "Last Breath Box Color", "dtimers_last_breath_box", accent,
+					dtf::getLastBreathBoxColor, dtf::setLastBreathBoxColor, 0xFFFF55FF);
+			}
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature dcf) {
 			drawDungeonsCopilotContent(graphics, dcf, x, y, width, height, accent, mouseX, mouseY);
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DungeonRoutesFeature drf) {
@@ -4135,6 +4399,7 @@ public class MainScreen extends Screen {
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!racism", ccf.isRacism(), () -> { ccf.setRacism(!ccf.isRacism()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!ping", ccf.isPing(), () -> { ccf.setPing(!ccf.isPing()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!fps", ccf.isFps(), () -> { ccf.setFps(!ccf.isFps()); ConfigManager.save(); });
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!tps", ccf.isTps(), () -> { ccf.setTps(!ccf.isTps()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!time", ccf.isTime(), () -> { ccf.setTime(!ccf.isTime()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!location", ccf.isLocation(), () -> { ccf.setLocation(!ccf.isLocation()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!holding", ccf.isHolding(), () -> { ccf.setHolding(!ccf.isHolding()); ConfigManager.save(); });
@@ -4147,6 +4412,8 @@ public class MainScreen extends Screen {
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!kick (party)", ccf.isKick(), () -> { ccf.setKick(!ccf.isKick()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!kickoffline (party)", ccf.isKickOffline(), () -> { ccf.setKickOffline(!ccf.isKickOffline()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!downtime / !undowntime (party)", ccf.isDt(), () -> { ccf.setDt(!ccf.isDt()); ConfigManager.save(); });
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Diana Party Commands (party)", ccf.isDianaCommands(), () -> { ccf.setDianaCommands(!ccf.isDianaCommands()); ConfigManager.save(); },
+				"SBO's Diana commands for your tracker: !chim, !chimls, !inq, !king, !manti, !sphinx, !stick, !relic, !feathers, !coins, !mobs, !burrows, !since <item>, !stats <your name> and more.");
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!reinvite (party)", ccf.isReinvite(), () -> { ccf.setReinvite(!ccf.isReinvite()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "!f1-f7/!m1-m7/!t1-t5 (party)", ccf.isQueInstance(), () -> { ccf.setQueInstance(!ccf.isQueInstance()); ConfigManager.save(); });
 			rowY += 6;
@@ -4251,9 +4518,13 @@ public class MainScreen extends Screen {
 					"How opaque the full-screen tint is.");
 				rowY += 8;
 				colorPickerLabel(graphics, rowX, rowY, "Screen Color");
-				drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "early_enter_screen_color", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
+				rowY = drawFullColorPicker(graphics, rowX, rowY + 10, rowWidth, "early_enter_screen_color", COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
 					eedf::getScreenColor, c -> { eedf.setScreenColor((eedf.getScreenColor() & 0xFF000000) | (c & 0xFFFFFF)); ConfigManager.save(); }, 0xD9FF5555);
 			}
+			rowY += 4;
+			drawToggleRow(graphics, rowX, rowY, rowWidth, "Coordinate with Leap Menu", eedf.isCoordinateWithLeapMenu(),
+				() -> { eedf.setCoordinateWithLeapMenu(!eedf.isCoordinateWithLeapMenu()); ConfigManager.save(); },
+				"When an alert fires, opening the Leap Menu within 5 seconds hides every other teammate and shows just the early-entering player, centered — reverts to normal automatically once those 5 seconds pass.");
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.PartyFinderFeature pff) {
 			int rowX = x + 10;
 			int rowWidth = width - 20;
@@ -4348,11 +4619,11 @@ public class MainScreen extends Screen {
 			boolean listening = listeningForRawKey != null;
 			String keyLabel = listening ? "Press a key..." : (sbf.getBindSetKey() == GLFW.GLFW_KEY_UNKNOWN
 				? "NONE" : InputConstants.Type.KEYSYM.getOrCreate(sbf.getBindSetKey()).getDisplayName().getString());
-			graphics.text(this.font, "Bind-Set Key", rowX, rowY, Theme.text(0xFFAAAAAA));
-			int keyBoxWidth = Math.max(70, this.font.width(keyLabel) + 10);
+			this.text(graphics, "Bind-Set Key", rowX, rowY, Theme.text(0xFFAAAAAA));
+			int keyBoxWidth = Math.max(70, this.textWidth(keyLabel) + 10);
 			int keyBoxX = rowX + rowWidth - keyBoxWidth;
 			fillRounded(graphics, keyBoxX, rowY - 1, keyBoxX + keyBoxWidth, rowY + 13, SMALL_RADIUS, listening ? accent : Theme.chrome(0xFF2A2A2A));
-			graphics.text(this.font, keyLabel, keyBoxX + (keyBoxWidth - this.font.width(keyLabel)) / 2, rowY + 2, Theme.text(0xFFFFFFFF));
+			this.text(graphics, keyLabel, keyBoxX + (keyBoxWidth - this.textWidth(keyLabel)) / 2, rowY + 2, Theme.text(0xFFFFFFFF));
 			clickHits.add(new ClickHit(keyBoxX, rowY - 1, keyBoxWidth, 14, () ->
 				listeningForRawKey = keyCode -> { sbf.setBindSetKey(keyCode); ConfigManager.save(); }));
 			rowY += 18 + 8;
@@ -4431,7 +4702,7 @@ public class MainScreen extends Screen {
 			rowY += 6;
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Send Progress Message",
 				mmf.isSendProgress(), () -> { mmf.setSendProgress(!mmf.isSendProgress()); ConfigManager.save(); });
-			graphics.text(this.font, "Prefix (appears as \"Prefix (N/4)\")", rowX, rowY + 2, Theme.text(0xFFAAAAAA));
+			this.text(graphics, "Prefix (appears as \"Prefix (N/4)\")", rowX, rowY + 2, Theme.text(0xFFAAAAAA));
 			drawGenericTextField(graphics, "melody_progress_msg", rowX, rowY + 12, rowWidth, 16,
 				"Melody", mmf::getProgressMessage, mmf::setProgressMessage);
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ItemRarityBackgroundFeature irbf) {
@@ -4448,7 +4719,7 @@ public class MainScreen extends Screen {
 				kfb.isPreventNonBedrock(), () -> { kfb.setPreventNonBedrock(!kfb.isPreventNonBedrock()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Block on Rare Drops",
 				kfb.isPreventRareDrops(), () -> { kfb.setPreventRareDrops(!kfb.isPreventRareDrops()); ConfigManager.save(); });
-			graphics.text(this.font, "Rare-drop profit threshold (" + kfb.getThresholdDisplay() + ")", rowX, rowY, Theme.text(0xFFAAAAAA));
+			this.text(graphics, "Rare-drop profit threshold (" + kfb.getThresholdDisplay() + ")", rowX, rowY, Theme.text(0xFFAAAAAA));
 			drawKismetThresholdField(graphics, rowX, rowY + 10, rowWidth, 16, kfb);
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ArrowsDeviceFeature adf) {
 			int rowX = x + 10;
@@ -4713,6 +4984,16 @@ public class MainScreen extends Screen {
 				bcf.isMovePrediction(), () -> { bcf.setMovePrediction(!bcf.isMovePrediction()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Announce Move Time",
 				bcf.isPartyMoveTime(), () -> { bcf.setPartyMoveTime(!bcf.isPartyMoveTime()); ConfigManager.save(); });
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Watcher Speed Title",
+				bcf.isWatcherSpeedTitle(), () -> { bcf.setWatcherSpeedTitle(!bcf.isWatcherSpeedTitle()); ConfigManager.save(); },
+				"Titles \"Fast/Normal/Slow Watcher!\" when the Watcher starts moving, from how long its first spawns took (1.2-1.35s move = Fast, 1.5s = Normal, 1.65s+ = Slow).");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Announce Watcher Speed",
+				bcf.isWatcherSpeedParty(), () -> { bcf.setWatcherSpeedParty(!bcf.isWatcherSpeedParty()); ConfigManager.save(); },
+				"Sends the watcher speed in party chat.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Watcher Speed Sound",
+				bcf.isWatcherSpeedSoundEnabled(), () -> { bcf.setWatcherSpeedSoundEnabled(!bcf.isWatcherSpeedSoundEnabled()); ConfigManager.save(); },
+				"Plays a sound with the watcher speed title.");
+			if (bcf.isWatcherSpeedSoundEnabled()) rowY = drawSoundOptionRows(graphics, rowX, rowY, rowWidth, accent, bcf.getWatcherSpeedSound());
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "\"Kill Mobs\" Title",
 				bcf.isKillTitle(), () -> { bcf.setKillTitle(!bcf.isKillTitle()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Watcher Mobs Left Counter",
@@ -4835,8 +5116,20 @@ public class MainScreen extends Screen {
 				declutter.isHideSellMessages(), () -> { declutter.setHideSellMessages(!declutter.isHideSellMessages()); ConfigManager.save(); });
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Healer Orb Messages",
 				declutter.isHideHealerOrbMessages(), () -> { declutter.setHideHealerOrbMessages(!declutter.isHideHealerOrbMessages()); ConfigManager.save(); });
-			drawToggleRow(graphics, rowX, rowY, rowWidth, "Rare Reward Hider",
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Rare Reward Hider",
 				declutter.isHideRareReward(), () -> { declutter.setHideRareReward(!declutter.isHideRareReward()); ConfigManager.save(); });
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Teleporting Messages",
+				declutter.isHideTeleporting(), () -> { declutter.setHideTeleporting(!declutter.isHideTeleporting()); ConfigManager.save(); },
+				"Hides \"Teleporting to <player>.\" when you leap.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Revive Messages",
+				declutter.isHideReviving(), () -> { declutter.setHideReviving(!declutter.isHideReviving()); ConfigManager.save(); },
+				"Hides \"❣ <player> is reviving <player>!\".");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Wither Essence Messages",
+				declutter.isHideWitherEssence(), () -> { declutter.setHideWitherEssence(!declutter.isHideWitherEssence()); ConfigManager.save(); },
+				"Hides \"<player> found a Wither Essence! Everyone gains an extra essence!\", yours included.");
+			drawToggleRow(graphics, rowX, rowY, rowWidth, "Hide Autopet Messages",
+				declutter.isHideAutopet(), () -> { declutter.setHideAutopet(!declutter.isHideAutopet()); ConfigManager.save(); },
+				"Hides \"Autopet equipped your ...\".");
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.DisableEndermanDeathAnimationFeature dedaf) {
 			int rowY = drawToggleRow(graphics, x + 10, y + 7, width - 20, "Disable Dying Sound",
 				dedaf.isDisableDyingSound(), () -> { dedaf.setDisableDyingSound(!dedaf.isDisableDyingSound()); ConfigManager.save(); });
@@ -4891,12 +5184,12 @@ public class MainScreen extends Screen {
 			if (releaseState != com.cokelord.skyblocksimplified.api.GitHubReleaseApi.State.FOUND) {
 				String statusText = releaseState == com.cokelord.skyblocksimplified.api.GitHubReleaseApi.State.LOADING
 					? "Checking GitHub for patch notes..." : "No GitHub releases published yet.";
-				graphics.text(this.font, statusText, rowX, rowY, Theme.text(0xFF888888));
+				this.text(graphics, statusText, rowX, rowY, Theme.text(0xFF888888));
 			} else {
 				String heading = "Patch Notes"
 					+ (com.cokelord.skyblocksimplified.api.GitHubReleaseApi.getReleaseName() != null
 						? " — " + com.cokelord.skyblocksimplified.api.GitHubReleaseApi.getReleaseName() : "");
-				graphics.text(this.font, heading, rowX, rowY, accent);
+				this.text(graphics, heading, rowX, rowY, accent);
 				rowY += 14;
 				String body = com.cokelord.skyblocksimplified.api.GitHubReleaseApi.getReleaseBody();
 				if (body != null && !body.isBlank()) {
@@ -5067,6 +5360,19 @@ public class MainScreen extends Screen {
 			// Per user request: the "if sold" total is its own subtoggle now, not always-on whenever nonzero.
 			drawToggleRow(graphics, x + 10, y + 4, width - 20, "Show \"If Sold\" Total",
 				ahtf.isShowActiveTotal(), () -> { ahtf.setShowActiveTotal(!ahtf.isShowActiveTotal()); ConfigManager.save(); });
+		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf) {
+			int rowX = x + 10, rowWidth = width - 20, rowY = y + 4;
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Update Ready Notification",
+				mnf.isUpdateReadyEnabled(), () -> { mnf.setUpdateReadyEnabled(!mnf.isUpdateReadyEnabled()); ConfigManager.save(); },
+				"Shows this popup once per session when a mod update is found.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Export Successful Notification",
+				mnf.isExportSuccessEnabled(), () -> { mnf.setExportSuccessEnabled(!mnf.isExportSuccessEnabled()); ConfigManager.save(); },
+				"Shows this popup instead of a chat message whenever your config is exported to the clipboard.");
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Import Successful Notification",
+				mnf.isImportSuccessEnabled(), () -> { mnf.setImportSuccessEnabled(!mnf.isImportSuccessEnabled()); ConfigManager.save(); },
+				"Shows this popup instead of a chat message whenever a config is successfully imported.");
+			rowY += 4;
+			drawSoundOptionRows(graphics, rowX, rowY, rowWidth, accent, mnf.getSound());
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.AuctionTimersFeature atmf) {
 			int rowX = x + 10, rowWidth = width - 20, rowY = y + 4;
 			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Bold",
@@ -5172,23 +5478,18 @@ public class MainScreen extends Screen {
 				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isReduceRarityBackgroundUpdates(),
 				() -> { ptgf.setReduceRarityBackgroundUpdates(!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isReduceRarityBackgroundUpdates()); ConfigManager.save(); },
 				"A real throttle: only recomputes an inventory slot's rarity-color background tint when the item in that slot actually changes, instead of every frame. Safe to leave on — no visible behavior change.");
-			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Door Highlight",
-				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("door_highlight"),
-				() -> { com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.setMirrorEnabled("door_highlight",
-					!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("door_highlight")); ConfigManager.save(); },
-				"Quick-access mirror of the Door Highlight module's own on/off switch — turns off its continuous door-scanning/3D rendering to save frames.");
-			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Blood Camp",
-				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("blood_camp"),
-				() -> { com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.setMirrorEnabled("blood_camp",
-					!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("blood_camp")); ConfigManager.save(); },
-				"Quick-access mirror of the Blood Camp module's own on/off switch — turns off its continuous scanning/rendering to save frames.");
-			drawToggleRow(graphics, rowX, rowY, rowWidth, "Dungeon Map",
-				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("dungeon_map"),
-				() -> { com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.setMirrorEnabled("dungeon_map",
-					!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isMirrorEnabled("dungeon_map")); ConfigManager.save(); },
-				"Quick-access mirror of the Dungeon Map module's own on/off switch — turns off its continuous room/map scanning and rendering to save frames.");
-			// Pixelated Look's own mirror row is gone (per user request, pixelated rendering is unconditional
-			// now — see GuiAnimationsFeature's own doc comment), nothing left for it to toggle.
+			rowY = drawToggleRow(graphics, rowX, rowY, rowWidth, "Throttle Hide Nametags Scan",
+				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isThrottleNametagHiding(),
+				() -> { ptgf.setThrottleNametagHiding(!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isThrottleNametagHiding()); ConfigManager.save(); },
+				"Only matters if the Hide Nametags module is on. Cuts its render-distance entity scan to 1 in every 4 frames instead of every frame. Tradeoff: a nametag may flash visible for a frame or two right when an entity first comes into view, instead of being hidden instantly.");
+			drawToggleRow(graphics, rowX, rowY, rowWidth, "Throttle Maxor Detection Scan",
+				com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isThrottleMaxorScan(),
+				() -> { ptgf.setThrottleMaxorScan(!com.cokelord.skyblocksimplified.feature.impl.PerformanceTogglesFeature.isThrottleMaxorScan()); ConfigManager.save(); },
+				"Cuts a redundant F7 boss-fight detection scan (an entity-name search that's just a backup for two other, faster signals) to once every 5 ticks instead of every tick. Tradeoff: on the rare run where this scan is the fastest of the three signals to fire, boss-fight-gated features may take up to a quarter-second longer to activate.");
+			// The old "Door Highlight"/"Blood Camp"/"Dungeon Map" rows that used to sit here were removed: they
+			// were a second on/off switch for those modules themselves, not a performance option, so switching
+			// one off here (reads like "stop throttling") silently turned the real module off — the likely
+			// cause of the "Blood Camp / Dungeon Map keep turning themselves off" report.
 		} else if (feature instanceof com.cokelord.skyblocksimplified.feature.impl.SlotLockingFeature slf) {
 			// Per user request ("Allow users to change the color of the locks with the item locker module"):
 			// keeps the generic keybind-rebind row every keybind-only feature already gets, plus a new
@@ -5239,7 +5540,7 @@ public class MainScreen extends Screen {
 	 *  of row here so no type-picker dropdown is needed. */
 	private void drawEnchantParsingContent(GuiGraphicsExtractor graphics, CustomEnchantParsingFeature cef, int x, int y, int width, int height, int accent) {
 		int rowY = y + 4;
-		graphics.text(this.font, "Restyles matching \"Name Level\" lore to the chosen style below.", x + 10, rowY, Theme.text(0xFF888888));
+		this.text(graphics, "Restyles matching \"Name Level\" lore to the chosen style below.", x + 10, rowY, Theme.text(0xFF888888));
 		rowY += 14;
 
 		List<CustomEnchantParsingFeature.Rule> rules = cef.getRules();
@@ -5252,14 +5553,14 @@ public class MainScreen extends Screen {
 		addRuleButtonY = rowY + 2;
 		addRuleButtonSize = 16;
 		fillRounded(graphics, addRuleButtonX, addRuleButtonY, addRuleButtonX + addRuleButtonSize, addRuleButtonY + addRuleButtonSize, BOX_RADIUS, accent);
-		graphics.text(this.font, "+", addRuleButtonX + (addRuleButtonSize - this.font.width("+")) / 2, addRuleButtonY + (addRuleButtonSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "+", addRuleButtonX + (addRuleButtonSize - this.textWidth("+")) / 2, addRuleButtonY + (addRuleButtonSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		rowY = addRuleButtonY + addRuleButtonSize + 10;
 
 		// Per user request (task tracker #589 — "per-tier color/bold/italic overrides"): a flat style
 		// applied to ANY enchant at that exact level, for banding a whole loadout by tier without hand-
 		// adding a same-styled Rule per enchant name — see TierOverride's own doc comment for how this
 		// interacts with (and always loses to) a more specific per-name Rule above.
-		graphics.text(this.font, "Tier Overrides", x + 10, rowY, Theme.text(0xFFAAAAAA));
+		this.text(graphics, "Tier Overrides", x + 10, rowY, Theme.text(0xFFAAAAAA));
 		rowY += 12;
 		CustomEnchantParsingFeature.TierOverride[] tiers = cef.getTierOverrides();
 		for (int level = 1; level <= tiers.length; level++) {
@@ -5329,7 +5630,7 @@ public class MainScreen extends Screen {
 		addPosMsgButtonHeight = 16;
 		fillRounded(graphics, addPosMsgButtonX, addPosMsgButtonY, addPosMsgButtonX + addPosMsgButtonWidth, addPosMsgButtonY + addPosMsgButtonHeight, BOX_RADIUS, accent);
 		String addLabel = "+ Add Positional Message";
-		graphics.text(this.font, addLabel, addPosMsgButtonX + (addPosMsgButtonWidth - this.font.width(addLabel)) / 2,
+		this.text(graphics, addLabel, addPosMsgButtonX + (addPosMsgButtonWidth - this.textWidth(addLabel)) / 2,
 			addPosMsgButtonY + (addPosMsgButtonHeight - 8) / 2, 0xFFFFFFFF);
 
 		if (isStylePopupOpen()) {
@@ -5462,6 +5763,24 @@ public class MainScreen extends Screen {
 			lcf::getCustomColor, c -> { lcf.setCustomColor((lcf.getCustomColor() & 0xFF000000) | (c & 0xFFFFFF)); ConfigManager.save(); }, 0xFFFFFFFF);
 	}
 
+	/** Shared renderer for every export button on this screen (Config, Boss Guide, Positional Messages,
+	 *  Dungeon Routes all-rooms/room) — per user request, each one gets a live 10-second cooldown after a
+	 *  successful export, counting down with one decimal place in place of its normal label, so the button
+	 *  can't be spam-clicked into re-exporting/re-notifying repeatedly. {@code width}/{@code height} must
+	 *  already be sized against {@code normalLabel} (every caller computes them that way, same as before this
+	 *  existed) — the countdown text is only ever centered inside that fixed box, never used to size it, so
+	 *  the button never changes size while counting down. */
+	private void drawExportButtonWithCooldown(GuiGraphicsExtractor graphics, int x, int y, int width, int height,
+											   int accent, String normalLabel, long cooldownEndNanos) {
+		long now = System.nanoTime();
+		boolean onCooldown = now < cooldownEndNanos;
+		fillRounded(graphics, x, y, x + width, y + height, BOX_RADIUS, onCooldown ? RenderUtil.darken(accent, 0.35f) : accent);
+		String label = onCooldown
+			? String.format(Locale.ROOT, "%.1fs", (cooldownEndNanos - now) / 1_000_000_000f)
+			: normalLabel;
+		this.text(graphics, label, x + (width - this.textWidth(label)) / 2, y + (height - 8) / 2, 0xFFFFFFFF);
+	}
+
 	/** Config export/import, drawn directly in its own always-visible module-list row: "Config" label,
 	 *  a paste box that fills the space between it and the export button, and the export button itself —
 	 *  per user request, as simple as that, no cog/expand step needed. Import happens automatically the
@@ -5472,25 +5791,59 @@ public class MainScreen extends Screen {
 	private void drawConfigRowInline(GuiGraphicsExtractor graphics, Feature feature, int rowX, int rowTop, int rowWidth, int rowInnerHeight, int accent) {
 		configRowVisible = true;
 		String label = feature.getDisplayName();
-		int labelWidth = this.font.width(label) + 16;
+		int labelWidth = this.textWidth(label) + 16;
 
 		configExportButtonHeight = 18;
 		configExportButtonY = rowTop + (rowInnerHeight - configExportButtonHeight) / 2;
 		String exportLabel = "Export to Clipboard";
-		configExportButtonWidth = this.font.width(exportLabel) + 12;
+		configExportButtonWidth = this.textWidth(exportLabel) + 12;
 		configExportButtonX = rowX + rowWidth - configExportButtonWidth - 4;
-		fillRounded(graphics, configExportButtonX, configExportButtonY, configExportButtonX + configExportButtonWidth,
-			configExportButtonY + configExportButtonHeight, BOX_RADIUS, accent);
-		graphics.text(this.font, exportLabel, configExportButtonX + (configExportButtonWidth - this.font.width(exportLabel)) / 2,
-			configExportButtonY + (configExportButtonHeight - 8) / 2, 0xFFFFFFFF);
+		drawExportButtonWithCooldown(graphics, configExportButtonX, configExportButtonY, configExportButtonWidth, configExportButtonHeight,
+			accent, exportLabel, configExportCooldownEndNanos);
+
+		configFileButtonHeight = 18;
+		configFileButtonY = rowTop + (rowInnerHeight - configFileButtonHeight) / 2;
+		String fileLabel = "Import File";
+		configFileButtonWidth = this.textWidth(fileLabel) + 12;
+		configFileButtonX = configExportButtonX - configFileButtonWidth - 6;
+		fillRounded(graphics, configFileButtonX, configFileButtonY, configFileButtonX + configFileButtonWidth,
+			configFileButtonY + configFileButtonHeight, BOX_RADIUS, 0xFF3A3A3A);
+		this.text(graphics, fileLabel, configFileButtonX + (configFileButtonWidth - this.textWidth(fileLabel)) / 2,
+			configFileButtonY + (configFileButtonHeight - 8) / 2, 0xFFFFFFFF);
 
 		configImportBoxHeight = 18;
 		configImportBoxY = rowTop + (rowInnerHeight - configImportBoxHeight) / 2;
 		configImportBoxX = rowX + labelWidth;
-		configImportBoxWidth = configExportButtonX - 8 - configImportBoxX;
+		configImportBoxWidth = configFileButtonX - 8 - configImportBoxX;
 		drawTextField(graphics, configImportBoxX, configImportBoxY, Math.max(0, configImportBoxWidth), configImportBoxHeight,
 			configImportBuffer.isEmpty() && textFocus != TextFocus.CONFIG_IMPORT ? "§7Paste configs here" : configImportBuffer,
 			textFocus == TextFocus.CONFIG_IMPORT);
+	}
+
+	/** "Import File" button click — per user request (see configFileButtonX's own doc comment): opens a
+	 *  native file-browse dialog filtered to .txt, reads the whole file as text, and imports it exactly like
+	 *  a pasted config string would (same {@link #attemptConfigImport()} path, so the same success/failure
+	 *  feedback applies). Blocking on purpose — see the existing custom-image/custom-sound file pickers this
+	 *  mirrors for why a native dialog freezing the frame while open is expected, not a stray hang. */
+	private void attemptConfigFileImport() {
+		String picked;
+		try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+			org.lwjgl.PointerBuffer filters = stack.pointers(stack.UTF8("*.txt"));
+			picked = org.lwjgl.util.tinyfd.TinyFileDialogs.tinyfd_openFileDialog(
+				"Select config file", "", filters, "Text files", false);
+		}
+		if (picked == null) return;
+		String content;
+		try {
+			content = java.nio.file.Files.readString(java.nio.file.Path.of(picked));
+		} catch (Exception e) {
+			if (this.minecraft.player != null) {
+				this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal("§cFailed to read that file."));
+			}
+			return;
+		}
+		configImportBuffer = content.strip();
+		attemptConfigImport();
 	}
 
 	/** Mod Information's row — same "always-visible single-line bar, nothing to click" shape as
@@ -5523,11 +5876,11 @@ public class MainScreen extends Screen {
 
 	private void drawModInformationRowInline(GuiGraphicsExtractor graphics, int rowX, int rowTop, int rowWidth, int rowInnerHeight) {
 		String label = "Mod Information";
-		int labelWidth = this.font.width(label) + 16;
+		int labelWidth = this.textWidth(label) + 16;
 
 		String currentVersion = com.cokelord.skyblocksimplified.api.UpdateApi.getCurrentVersion();
 		String versionText = "v" + currentVersion;
-		graphics.text(this.font, versionText, rowX + labelWidth, rowTop + (rowInnerHeight - 8) / 2, Theme.text(0xFFAAAAAA));
+		this.text(graphics, versionText, rowX + labelWidth, rowTop + (rowInnerHeight - 8) / 2, Theme.text(0xFFAAAAAA));
 
 		String latestVersion = com.cokelord.skyblocksimplified.api.UpdateApi.getLatestVersion();
 		String statusText;
@@ -5547,9 +5900,9 @@ public class MainScreen extends Screen {
 		// Tested."/"Checking..." to not land inside the cog itself. Mirrors the exact cogX formula the main
 		// row-drawing loop now uses for every no-toggle-content feature (12px cog + 8px cog gap + 8px slot
 		// gap = 28px from the row's right edge), plus 6px of its own clearance so the text never touches it.
-		int statusX = rowX + rowWidth - this.font.width(statusText) - 34;
+		int statusX = rowX + rowWidth - this.textWidth(statusText) - 34;
 		// Per user report, this text sat 1px too high relative to the row's other text baselines.
-		graphics.text(this.font, statusText, statusX, rowTop + (rowInnerHeight - 8) / 2 + 1, statusColor);
+		this.text(graphics, statusText, statusX, rowTop + (rowInnerHeight - 8) / 2 + 1, statusColor);
 	}
 
 	/** Dungeons Copilot's own standalone export/import row — same shape as drawConfigRowInline above, but
@@ -5559,20 +5912,18 @@ public class MainScreen extends Screen {
 	private int drawCopilotConfigRow(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature dcf,
 									  int rowX, int rowY, int rowWidth, int accent) {
 		String label = "Config:";
-		int labelWidth = this.font.width(label) + 8;
+		int labelWidth = this.textWidth(label) + 8;
 		int rowHeight = 18;
 
 		copilotExportButtonHeight = rowHeight;
 		copilotExportButtonY = rowY;
 		String exportLabel = "Export";
-		copilotExportButtonWidth = this.font.width(exportLabel) + 12;
+		copilotExportButtonWidth = this.textWidth(exportLabel) + 12;
 		copilotExportButtonX = rowX + rowWidth - copilotExportButtonWidth;
-		fillRounded(graphics, copilotExportButtonX, copilotExportButtonY, copilotExportButtonX + copilotExportButtonWidth,
-			copilotExportButtonY + copilotExportButtonHeight, BOX_RADIUS, accent);
-		graphics.text(this.font, exportLabel, copilotExportButtonX + (copilotExportButtonWidth - this.font.width(exportLabel)) / 2,
-			copilotExportButtonY + (copilotExportButtonHeight - 8) / 2, 0xFFFFFFFF);
+		drawExportButtonWithCooldown(graphics, copilotExportButtonX, copilotExportButtonY, copilotExportButtonWidth, copilotExportButtonHeight,
+			accent, exportLabel, copilotExportCooldownEndNanos);
 
-		graphics.text(this.font, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
 		copilotImportBoxHeight = rowHeight;
 		copilotImportBoxY = rowY;
 		copilotImportBoxX = rowX + labelWidth;
@@ -5588,20 +5939,18 @@ public class MainScreen extends Screen {
 	private int drawPosMsgConfigRow(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.impl.PositionalMessagesFeature pmf,
 									 int rowX, int rowY, int rowWidth, int accent) {
 		String label = "Config:";
-		int labelWidth = this.font.width(label) + 8;
+		int labelWidth = this.textWidth(label) + 8;
 		int rowHeight = 18;
 
 		posMsgConfigExportButtonHeight = rowHeight;
 		posMsgConfigExportButtonY = rowY;
 		String exportLabel = "Export";
-		posMsgConfigExportButtonWidth = this.font.width(exportLabel) + 12;
+		posMsgConfigExportButtonWidth = this.textWidth(exportLabel) + 12;
 		posMsgConfigExportButtonX = rowX + rowWidth - posMsgConfigExportButtonWidth;
-		fillRounded(graphics, posMsgConfigExportButtonX, posMsgConfigExportButtonY, posMsgConfigExportButtonX + posMsgConfigExportButtonWidth,
-			posMsgConfigExportButtonY + posMsgConfigExportButtonHeight, BOX_RADIUS, accent);
-		graphics.text(this.font, exportLabel, posMsgConfigExportButtonX + (posMsgConfigExportButtonWidth - this.font.width(exportLabel)) / 2,
-			posMsgConfigExportButtonY + (posMsgConfigExportButtonHeight - 8) / 2, 0xFFFFFFFF);
+		drawExportButtonWithCooldown(graphics, posMsgConfigExportButtonX, posMsgConfigExportButtonY, posMsgConfigExportButtonWidth, posMsgConfigExportButtonHeight,
+			accent, exportLabel, posMsgExportCooldownEndNanos);
 
-		graphics.text(this.font, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
 		posMsgConfigImportBoxHeight = rowHeight;
 		posMsgConfigImportBoxY = rowY;
 		posMsgConfigImportBoxX = rowX + labelWidth;
@@ -5617,20 +5966,18 @@ public class MainScreen extends Screen {
 	private int drawRouteAllConfigRow(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.impl.DungeonRoutesFeature drf,
 									   int rowX, int rowY, int rowWidth, int accent) {
 		String label = "All Rooms:";
-		int labelWidth = this.font.width(label) + 8;
+		int labelWidth = this.textWidth(label) + 8;
 		int rowHeight = 18;
 
 		routeAllExportButtonHeight = rowHeight;
 		routeAllExportButtonY = rowY;
 		String exportLabel = "Export";
-		routeAllExportButtonWidth = this.font.width(exportLabel) + 12;
+		routeAllExportButtonWidth = this.textWidth(exportLabel) + 12;
 		routeAllExportButtonX = rowX + rowWidth - routeAllExportButtonWidth;
-		fillRounded(graphics, routeAllExportButtonX, routeAllExportButtonY, routeAllExportButtonX + routeAllExportButtonWidth,
-			routeAllExportButtonY + routeAllExportButtonHeight, BOX_RADIUS, accent);
-		graphics.text(this.font, exportLabel, routeAllExportButtonX + (routeAllExportButtonWidth - this.font.width(exportLabel)) / 2,
-			routeAllExportButtonY + (routeAllExportButtonHeight - 8) / 2, 0xFFFFFFFF);
+		drawExportButtonWithCooldown(graphics, routeAllExportButtonX, routeAllExportButtonY, routeAllExportButtonWidth, routeAllExportButtonHeight,
+			accent, exportLabel, routeAllExportCooldownEndNanos);
 
-		graphics.text(this.font, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
 		routeAllImportBoxHeight = rowHeight;
 		routeAllImportBoxY = rowY;
 		routeAllImportBoxX = rowX + labelWidth;
@@ -5683,20 +6030,18 @@ public class MainScreen extends Screen {
 	private int drawRouteRoomConfigRow(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.impl.DungeonRoutesFeature drf,
 										String roomName, int rowX, int rowY, int rowWidth, int accent) {
 		String label = "Room:";
-		int labelWidth = this.font.width(label) + 8;
+		int labelWidth = this.textWidth(label) + 8;
 		int rowHeight = 18;
 
 		routeRoomExportButtonHeight = rowHeight;
 		routeRoomExportButtonY = rowY;
 		String exportLabel = "Export";
-		routeRoomExportButtonWidth = this.font.width(exportLabel) + 12;
+		routeRoomExportButtonWidth = this.textWidth(exportLabel) + 12;
 		routeRoomExportButtonX = rowX + rowWidth - routeRoomExportButtonWidth;
-		fillRounded(graphics, routeRoomExportButtonX, routeRoomExportButtonY, routeRoomExportButtonX + routeRoomExportButtonWidth,
-			routeRoomExportButtonY + routeRoomExportButtonHeight, BOX_RADIUS, accent);
-		graphics.text(this.font, exportLabel, routeRoomExportButtonX + (routeRoomExportButtonWidth - this.font.width(exportLabel)) / 2,
-			routeRoomExportButtonY + (routeRoomExportButtonHeight - 8) / 2, 0xFFFFFFFF);
+		drawExportButtonWithCooldown(graphics, routeRoomExportButtonX, routeRoomExportButtonY, routeRoomExportButtonWidth, routeRoomExportButtonHeight,
+			accent, exportLabel, routeRoomExportCooldownEndNanos);
 
-		graphics.text(this.font, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, rowX, rowY + (rowHeight - 8) / 2, Theme.text(0xFFAAAAAA));
 		routeRoomImportBoxHeight = rowHeight;
 		routeRoomImportBoxY = rowY;
 		routeRoomImportBoxX = rowX + labelWidth;
@@ -5758,11 +6103,17 @@ public class MainScreen extends Screen {
 	private void attemptConfigImport() {
 		if (configImportBuffer.isEmpty()) return;
 		int applied = ConfigManager.importFromClipboardString(configImportBuffer);
-		if (this.minecraft.player != null) {
-			String msg = applied >= 0
-				? "§aImported " + applied + " module setting" + (applied == 1 ? "" : "s") + "."
-				: "§cThat doesn't look like a valid config string.";
-			this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(msg));
+		if (applied >= 0) {
+			// Per user request ("Import successful notification, provides a notification like 'Import
+			// successful!' when importing a config"): same shared toast Export Successful/Update Ready use,
+			// gated on Mod Notifications' own Import Successful subtoggle instead of always firing.
+			if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+					|| mnf.isImportSuccessEnabled()) {
+				com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Import successful!",
+					"Imported " + applied + " module setting" + (applied == 1 ? "" : "s") + ".");
+			}
+		} else if (this.minecraft.player != null) {
+			this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal("§cThat doesn't look like a valid config string."));
 		}
 		if (applied >= 0) {
 			configImportBuffer = "";
@@ -5776,7 +6127,7 @@ public class MainScreen extends Screen {
 	private void drawVisualWordsContent(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.impl.VisualWordsFeature vwf,
 										 int x, int y, int width, int accent) {
 		int rowY = y + 4;
-		graphics.text(this.font, "Replaces matching text anywhere it's visible in chat/system messages.", x + 10, rowY, Theme.text(0xFF888888));
+		this.text(graphics, "Replaces matching text anywhere it's visible in chat/system messages.", x + 10, rowY, Theme.text(0xFF888888));
 		rowY += 14;
 
 		List<com.cokelord.skyblocksimplified.feature.impl.VisualWordsFeature.WordReplacement> list = vwf.getReplacements();
@@ -5790,7 +6141,7 @@ public class MainScreen extends Screen {
 		addVisualWordButtonSize = 16;
 		fillRounded(graphics, addVisualWordButtonX, addVisualWordButtonY, addVisualWordButtonX + addVisualWordButtonSize,
 			addVisualWordButtonY + addVisualWordButtonSize, BOX_RADIUS, accent);
-		graphics.text(this.font, "+", addVisualWordButtonX + (addVisualWordButtonSize - this.font.width("+")) / 2,
+		this.text(graphics, "+", addVisualWordButtonX + (addVisualWordButtonSize - this.textWidth("+")) / 2,
 			addVisualWordButtonY + (addVisualWordButtonSize - 8) / 2, 0xFFFFFFFF);
 	}
 
@@ -5804,7 +6155,7 @@ public class MainScreen extends Screen {
 		int removeX = x + width - 8 - btnSize;
 		int removeY = y + 2;
 		fillCircle(graphics, removeX + btnSize / 2, removeY + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", removeX + (btnSize - this.font.width("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", removeX + (btnSize - this.textWidth("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(removeX, removeY, btnSize, btnSize, () -> {
 			if (expandTarget instanceof com.cokelord.skyblocksimplified.feature.impl.VisualWordsFeature vwf) vwf.removeReplacement(index);
 		}));
@@ -5834,10 +6185,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty();
 		String display = !editing && empty ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -5875,10 +6226,10 @@ public class MainScreen extends Screen {
 		graphics.enableScissor(boxX, y, boxX + boxWidth, y + NOTIF_ROW_HEIGHT);
 		String display = !editing && value.isEmpty() ? type.displayName + "!" : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, y + 2, NOTIF_ROW_HEIGHT - 4);
-		graphics.text(this.font, display, boxX + 4, y + 4, !editing && value.isEmpty() ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, y + 4, !editing && value.isEmpty() ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, y + 3, caretX + 1, y + NOTIF_ROW_HEIGHT - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -5916,10 +6267,10 @@ public class MainScreen extends Screen {
 		String placeholder = "Party chat message...";
 		String display = !editing && value.isEmpty() ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, y + 2, NOTIF_ROW_HEIGHT - 4);
-		graphics.text(this.font, display, boxX + 4, y + 4, !editing && value.isEmpty() ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, y + 4, !editing && value.isEmpty() ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, y + 3, caretX + 1, y + NOTIF_ROW_HEIGHT - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -5959,7 +6310,7 @@ public class MainScreen extends Screen {
 			int bg = selected ? accent : (enabled ? Theme.chrome(0xFF2A2A2A) : Theme.chrome(0xFF1A1A1A));
 			fillRounded(graphics, bx, rowY, bx + btnW, rowY + btnH, SMALL_RADIUS, bg);
 			String label = copilotClassLabel(clazz);
-			graphics.text(this.font, label, bx + (btnW - this.font.width(label)) / 2, rowY + 5, enabled ? 0xFFFFFFFF : 0xFF888888);
+			this.text(graphics, label, bx + (btnW - this.textWidth(label)) / 2, rowY + 5, enabled ? 0xFFFFFFFF : 0xFF888888);
 			int fbx = bx;
 			clickHits.add(new ClickHit(fbx, rowY, btnW, btnH, () -> { selectedCopilotClass = clazz; dcf.setEditModeClass(clazz); }));
 			bx += btnW + 4;
@@ -6011,7 +6362,7 @@ public class MainScreen extends Screen {
 		int addH = 16;
 		fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + addH, BOX_RADIUS, accent);
 		String addLabel = "+ Add Step";
-		graphics.text(this.font, addLabel, rowX + (rowWidth - this.font.width(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
+		this.text(graphics, addLabel, rowX + (rowWidth - this.textWidth(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(rowX, rowY, rowWidth, addH, () -> dcf.addItem(selectedCopilotClass)));
 		// Per user request ("Also add the little plus button like we did in dungeon routes"): same
 		// off-screen fallback as routeAddStepAction (see its own doc comment) for this panel's own button.
@@ -6056,7 +6407,7 @@ public class MainScreen extends Screen {
 		int cursorX = x + width - btnSize;
 
 		fillCircle(graphics, cursorX + btnSize / 2, y + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", cursorX + (btnSize - this.font.width("x")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", cursorX + (btnSize - this.textWidth("x")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(cursorX, y, btnSize, btnSize, () -> dcf.removeItem(item)));
 		cursorX -= btnSize + 4;
 
@@ -6076,13 +6427,16 @@ public class MainScreen extends Screen {
 			case DEVICE_FINISHED -> "Device";
 			case LEAP_USED -> "Leap";
 			case TERMINAL_DONE -> "Terminal Done";
+			case RELIC_PICKED_UP -> "Relic Picked Up";
+			case RELIC_PLACED -> "Relic Placed";
+			case DRAGON_DEAD -> "Dragon Dead";
 			case BLOCK_WATCH -> "Block Watch";
 			case LEVER_FLIPPED -> "Lever";
 		};
-		int typeW = this.font.width(typeLabel) + 10;
+		int typeW = this.textWidth(typeLabel) + 10;
 		cursorX -= typeW;
 		fillRounded(graphics, cursorX, y, cursorX + typeW, y + btnSize, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, typeLabel, cursorX + 5, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, typeLabel, cursorX + 5, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(cursorX, y, typeW, btnSize, () -> dcf.cycleType(item)));
 		cursorX -= 4;
 
@@ -6091,7 +6445,7 @@ public class MainScreen extends Screen {
 		boolean stepBeingDragged = stepDragItem == item && stepDragCommitted;
 		fillRounded(graphics, cursorX, y, cursorX + stepBoxW, y + btnSize, SMALL_RADIUS, stepBeingDragged ? accent : Theme.chrome(0xFF262626));
 		String stepLabel = "#" + item.stepNumber;
-		graphics.text(this.font, stepLabel, cursorX + (stepBoxW - this.font.width(stepLabel)) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, stepLabel, cursorX + (stepBoxW - this.textWidth(stepLabel)) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		int stepBoxX = cursorX;
 		// Real bug found (per user report): this box used to split into a left-half-decrements/right-half-
 		// increments stepper — a 17px-wide click target either half, easy to miss and land on the WRONG half,
@@ -6113,7 +6467,7 @@ public class MainScreen extends Screen {
 		if (item.type == com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature.StepType.BREAKABLE_BLOCKS) {
 			int advW = btnSize;
 			fillRounded(graphics, x, y, x + advW, y + btnSize, SMALL_RADIUS, item.advancesStep ? accent : Theme.chrome(0xFF2A2A2A));
-			graphics.text(this.font, "A", x + (advW - this.font.width("A")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+			this.text(graphics, "A", x + (advW - this.textWidth("A")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 			clickHits.add(new ClickHit(x, y, advW, btnSize, () -> { item.advancesStep = !item.advancesStep; ConfigManager.save(); }));
 			checkHoverTooltip(mouseX, mouseY, x, y, advW, btnSize, "copilot_advances_step_" + System.identityHashCode(item),
 				"Advances Step: whether all the tracked blocks being broken moves the guide to the next step. "
@@ -6139,13 +6493,13 @@ public class MainScreen extends Screen {
 				int useW = (width - 8) / 2;
 				fillRounded(graphics, x, curY, x + useW, curY + rowH, SMALL_RADIUS, accent);
 				String useLabel = "Use Looked-At Block";
-				graphics.text(this.font, useLabel, x + (useW - this.font.width(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, useLabel, x + (useW - this.textWidth(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(x, curY, useW, rowH, () -> dcf.useLookedAtBlock(item)));
 				int clearX = x + useW + 8;
 				int clearW = width - useW - 8;
 				fillRounded(graphics, clearX, curY, clearX + clearW, curY + rowH, SMALL_RADIUS, 0xFF3A1E1E);
 				String clearLabel = "Clear (" + item.blocks.size() + ")";
-				graphics.text(this.font, clearLabel, clearX + (clearW - this.font.width(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, clearLabel, clearX + (clearW - this.textWidth(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(clearX, curY, clearW, rowH, () -> dcf.clearBlocks(item)));
 				curY += rowH + 3;
 			}
@@ -6159,13 +6513,13 @@ public class MainScreen extends Screen {
 				int useW = (width - 8) / 2;
 				fillRounded(graphics, x, curY, x + useW, curY + rowH, SMALL_RADIUS, accent);
 				String useLabel = "Use Looked-At Block";
-				graphics.text(this.font, useLabel, x + (useW - this.font.width(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, useLabel, x + (useW - this.textWidth(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(x, curY, useW, rowH, () -> dcf.useLookedAtBlock(item)));
 				int clearX = x + useW + 8;
 				int clearW = width - useW - 8;
 				fillRounded(graphics, clearX, curY, clearX + clearW, curY + rowH, SMALL_RADIUS, 0xFF3A1E1E);
 				String clearLabel = "Clear (" + item.blocks.size() + ")";
-				graphics.text(this.font, clearLabel, clearX + (clearW - this.font.width(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, clearLabel, clearX + (clearW - this.textWidth(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(clearX, curY, clearW, rowH, () -> dcf.clearBlocks(item)));
 				curY += rowH + 3;
 
@@ -6181,13 +6535,13 @@ public class MainScreen extends Screen {
 				int useW = (width - 8) / 2;
 				fillRounded(graphics, x, curY, x + useW, curY + rowH, SMALL_RADIUS, accent);
 				String useLabel = "Use Looked-At Block";
-				graphics.text(this.font, useLabel, x + (useW - this.font.width(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, useLabel, x + (useW - this.textWidth(useLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(x, curY, useW, rowH, () -> dcf.useLookedAtBlock(item)));
 				int clearX = x + useW + 8;
 				int clearW = width - useW - 8;
 				fillRounded(graphics, clearX, curY, clearX + clearW, curY + rowH, SMALL_RADIUS, 0xFF3A1E1E);
 				String clearLabel = "Clear (" + item.blocks.size() + ")";
-				graphics.text(this.font, clearLabel, clearX + (clearW - this.font.width(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, clearLabel, clearX + (clearW - this.textWidth(clearLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(clearX, curY, clearW, rowH, () -> dcf.clearBlocks(item)));
 				curY += rowH + 3;
 			}
@@ -6200,7 +6554,7 @@ public class MainScreen extends Screen {
 				int useW = width - (fx - x);
 				fillRounded(graphics, fx, curY, fx + useW, curY + rowH, SMALL_RADIUS, accent);
 				String label = "Use Pos";
-				graphics.text(this.font, label, fx + (useW - this.font.width(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, label, fx + (useW - this.textWidth(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				int useX = fx;
 				clickHits.add(new ClickHit(useX, curY, useW, rowH, () -> dcf.useCurrentPosition(item)));
 				curY += rowH + 3;
@@ -6209,16 +6563,16 @@ public class MainScreen extends Screen {
 				int kindW = width;
 				fillRounded(graphics, x, curY, x + kindW, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 				String kindLabel = "Device: " + item.deviceKind.name();
-				graphics.text(this.font, kindLabel, x + (kindW - this.font.width(kindLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, kindLabel, x + (kindW - this.textWidth(kindLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(x, curY, kindW, rowH, () -> dcf.cycleDeviceKind(item)));
 				curY += rowH + 3;
 
 				if (item.deviceKind == com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature.DeviceKind.ALIGN
 					|| item.deviceKind == com.cokelord.skyblocksimplified.feature.impl.DungeonsCopilotFeature.DeviceKind.LEVERS) {
 					String pdLabel = "PD Mode";
-					int pdW = this.font.width(pdLabel) + 10;
+					int pdW = this.textWidth(pdLabel) + 10;
 					fillRounded(graphics, x, curY, x + pdW, curY + rowH, SMALL_RADIUS, item.pdMode ? accent : Theme.chrome(0xFF2A2A2A));
-					graphics.text(this.font, pdLabel, x + (pdW - this.font.width(pdLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+					this.text(graphics, pdLabel, x + (pdW - this.textWidth(pdLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 					clickHits.add(new ClickHit(x, curY, pdW, rowH, () -> { item.pdMode = !item.pdMode; ConfigManager.save(); }));
 					curY += rowH + 3;
 				}
@@ -6227,10 +6581,11 @@ public class MainScreen extends Screen {
 			// menu"): no per-item config needed at all — same one-shot, chat-confirmed shape as DEVICE_FINISHED
 			// but with no "kind" to pick and no PD Mode equivalent (see StepType.LEAP_USED's own doc comment),
 			// so this is purely an informational row telling the editor what already makes the step advance.
+			case RELIC_PICKED_UP, RELIC_PLACED, DRAGON_DEAD -> {} // no per-item config
 			case LEAP_USED -> {
 				String leapLabel = "Advances automatically on a real Spirit Leap";
 				fillRounded(graphics, x, curY, x + width, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-				graphics.text(this.font, leapLabel, x + (width - this.font.width(leapLabel)) / 2, curY + 4, Theme.text(0xFFAAAAAA));
+				this.text(graphics, leapLabel, x + (width - this.textWidth(leapLabel)) / 2, curY + 4, Theme.text(0xFFAAAAAA));
 				curY += rowH + 3;
 			}
 			// Per user request ("also create a Terminal done which detects when the terminal is finished
@@ -6243,13 +6598,13 @@ public class MainScreen extends Screen {
 			case TERMINAL_DONE -> {
 				String termLabel = item.pdMode ? "PD Mode: watches the Levers lamp grid" : "Advances on your own terminal-activation chat line";
 				fillRounded(graphics, x, curY, x + width, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-				graphics.text(this.font, termLabel, x + (width - this.font.width(termLabel)) / 2, curY + 4, Theme.text(0xFFAAAAAA));
+				this.text(graphics, termLabel, x + (width - this.textWidth(termLabel)) / 2, curY + 4, Theme.text(0xFFAAAAAA));
 				curY += rowH + 3;
 
 				String pdLabel = "PD Mode (Levers)";
-				int pdW = this.font.width(pdLabel) + 10;
+				int pdW = this.textWidth(pdLabel) + 10;
 				fillRounded(graphics, x, curY, x + pdW, curY + rowH, SMALL_RADIUS, item.pdMode ? accent : Theme.chrome(0xFF2A2A2A));
-				graphics.text(this.font, pdLabel, x + (pdW - this.font.width(pdLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, pdLabel, x + (pdW - this.textWidth(pdLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(x, curY, pdW, rowH, () -> { item.pdMode = !item.pdMode; ConfigManager.save(); }));
 				curY += rowH + 3;
 			}
@@ -6266,10 +6621,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty();
 		String display = !editing && empty ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6329,7 +6684,7 @@ public class MainScreen extends Screen {
 			fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + openCurrentH, SMALL_RADIUS, hasCurrentRoom ? accent : Theme.chrome(0xFF2A2A2A));
 			String openCurrentLabel = hasCurrentRoom ? "Open current room: " + currentRoom : "Open current room (not in a room)";
 			graphics.enableScissor(rowX, rowY, rowX + rowWidth, rowY + openCurrentH);
-			graphics.text(this.font, openCurrentLabel, rowX + 5, rowY + (openCurrentH - 8) / 2, hasCurrentRoom ? 0xFFFFFFFF : 0xFF888888);
+			this.text(graphics, openCurrentLabel, rowX + 5, rowY + (openCurrentH - 8) / 2, hasCurrentRoom ? 0xFFFFFFFF : 0xFF888888);
 			graphics.disableScissor();
 			if (hasCurrentRoom) {
 				clickHits.add(new ClickHit(rowX, rowY, rowWidth, openCurrentH, () -> selectedRouteRoomName = currentRoom));
@@ -6351,7 +6706,7 @@ public class MainScreen extends Screen {
 				fillRounded(graphics, tileX, rowY, tileX + tileW, rowY + tileH, SMALL_RADIUS, stepCount > 0 ? accent : Theme.chrome(0xFF2A2A2A));
 				graphics.enableScissor(tileX, rowY, tileX + tileW, rowY + tileH);
 				String label = stepCount > 0 ? roomName + " (" + stepCount + ")" : roomName;
-				graphics.text(this.font, label, tileX + 4, rowY + (tileH - 8) / 2, Theme.text(0xFFFFFFFF));
+				this.text(graphics, label, tileX + 4, rowY + (tileH - 8) / 2, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(tileX, rowY, tileW, tileH, () -> selectedRouteRoomName = roomName));
 				col++;
@@ -6364,7 +6719,7 @@ public class MainScreen extends Screen {
 			String backLabel = "< " + roomName;
 			fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + backH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 			graphics.enableScissor(rowX, rowY, rowX + rowWidth, rowY + backH);
-			graphics.text(this.font, backLabel, rowX + 5, rowY + 4, Theme.text(0xFFFFFFFF));
+			this.text(graphics, backLabel, rowX + 5, rowY + 4, Theme.text(0xFFFFFFFF));
 			graphics.disableScissor();
 			clickHits.add(new ClickHit(rowX, rowY, rowWidth, backH, () -> selectedRouteRoomName = null));
 			rowY += backH + 4;
@@ -6375,7 +6730,7 @@ public class MainScreen extends Screen {
 			int addH = 16;
 			fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + addH, BOX_RADIUS, accent);
 			String addLabel = "+ Add Step";
-			graphics.text(this.font, addLabel, rowX + (rowWidth - this.font.width(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
+			this.text(graphics, addLabel, rowX + (rowWidth - this.textWidth(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
 			clickHits.add(new ClickHit(rowX, rowY, rowWidth, addH, () -> drf.addItem(roomName)));
 			// Per user request ("Its super annoying scrolling up and down to add a step"): whenever the real
 			// button drawn just above is scrolled outside the panel's own visible viewport, the floating
@@ -6418,7 +6773,7 @@ public class MainScreen extends Screen {
 		int cursorX = x + width - btnSize;
 
 		fillCircle(graphics, cursorX + btnSize / 2, y + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", cursorX + (btnSize - this.font.width("x")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", cursorX + (btnSize - this.textWidth("x")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(cursorX, y, btnSize, btnSize, () -> drf.removeItem(item)));
 		cursorX -= btnSize + 4;
 
@@ -6433,10 +6788,10 @@ public class MainScreen extends Screen {
 		cursorX -= btnSize + 4;
 
 		String typeLabel = com.cokelord.skyblocksimplified.feature.impl.DungeonRoutesFeature.typeLabel(item.type);
-		int typeW = this.font.width(typeLabel) + 10;
+		int typeW = this.textWidth(typeLabel) + 10;
 		cursorX -= typeW;
 		fillRounded(graphics, cursorX, y, cursorX + typeW, y + btnSize, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, typeLabel, cursorX + 5, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, typeLabel, cursorX + 5, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(cursorX, y, typeW, btnSize, () -> drf.cycleType(item)));
 		// Per user report ("Theres a new 'Interact' trigger which i have no idea what it does") — every type
 		// badge now explains itself on hover (same 2-second-delay tooltip mechanism as "Advance Step" above),
@@ -6450,7 +6805,7 @@ public class MainScreen extends Screen {
 		boolean stepBeingDragged = stepDragItem == item && stepDragCommitted;
 		fillRounded(graphics, cursorX, y, cursorX + stepBoxW, y + btnSize, SMALL_RADIUS, stepBeingDragged ? accent : Theme.chrome(0xFF262626));
 		String stepLabel = "#" + item.stepNumber;
-		graphics.text(this.font, stepLabel, cursorX + (stepBoxW - this.font.width(stepLabel)) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, stepLabel, cursorX + (stepBoxW - this.textWidth(stepLabel)) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		int stepBoxX = cursorX;
 		// Same redesign as drawCopilotItemBlock's own step box — see its comment for the "left-click sends it
 		// backward" bug this replaces and the drag-to-reorder behavior this box now doubles as.
@@ -6472,7 +6827,7 @@ public class MainScreen extends Screen {
 		// hover tooltip (same 2-second-delay mechanism as every other tooltip on this screen) replaces it.
 		int advW = btnSize;
 		fillRounded(graphics, x, y, x + advW, y + btnSize, SMALL_RADIUS, item.advancesStep ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "A", x + (advW - this.font.width("A")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "A", x + (advW - this.textWidth("A")) / 2, y + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(x, y, advW, btnSize, () -> { item.advancesStep = !item.advancesStep; ConfigManager.save(); }));
 		checkHoverTooltip(mouseX, mouseY, x, y, advW, btnSize, "route_advances_step_" + System.identityHashCode(item),
 			"Advances Step: whether reaching or completing this item moves the route to the next step. Turn "
@@ -6483,7 +6838,7 @@ public class MainScreen extends Screen {
 			String hint = "Stand in this room to set positions";
 			int hintX = x + advW + 4;
 			graphics.enableScissor(hintX, y, cursorX - 4, y + btnSize);
-			graphics.text(this.font, hint, hintX, y + (btnSize - 8) / 2, Theme.text(0xFF888888));
+			this.text(graphics, hint, hintX, y + (btnSize - 8) / 2, Theme.text(0xFF888888));
 			graphics.disableScissor();
 		}
 
@@ -6513,14 +6868,14 @@ public class MainScreen extends Screen {
 				int ux = x;
 				fillRounded(graphics, ux, curY, ux + useW, curY + rowH, SMALL_RADIUS, accent);
 				graphics.enableScissor(ux, curY, ux + useW, curY + rowH);
-				graphics.text(this.font, "Use Looked-At Block", ux + 4, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "Use Looked-At Block", ux + 4, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(ux, curY, useW, rowH, () -> drf.useLookedAtBlock(item)));
 
 				int selX = ux + useW + gap;
 				fillRounded(graphics, selX, curY, selX + selW, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 				graphics.enableScissor(selX, curY, selX + selW, curY + rowH);
-				graphics.text(this.font, "Selected (" + item.blocks.size() + ")", selX + 4, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "Selected (" + item.blocks.size() + ")", selX + 4, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				int selXFinal = selX, selYFinal = curY;
 				clickHits.add(new ClickHit(selX, curY, selW, rowH, () -> {
@@ -6535,7 +6890,7 @@ public class MainScreen extends Screen {
 				drawRouteTextField(graphics, bfx, curY, fieldW, rowH, item.zInput, "Z", item, "z"); bfx += fieldW + gap;
 				fillRounded(graphics, bfx, curY, bfx + addW, curY + rowH, SMALL_RADIUS, accent);
 				graphics.enableScissor(bfx, curY, bfx + addW, curY + rowH);
-				graphics.text(this.font, "Add", bfx + (addW - this.font.width("Add")) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "Add", bfx + (addW - this.textWidth("Add")) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(bfx, curY, addW, rowH, () -> drf.addBlockFromInput(item)));
 				curY += rowH + 3;
@@ -6566,7 +6921,7 @@ public class MainScreen extends Screen {
 				int clearW = width - gap - useW;
 				fillRounded(graphics, x, curY, x + useW, curY + rowH, SMALL_RADIUS, accent);
 				graphics.enableScissor(x, curY, x + useW, curY + rowH);
-				graphics.text(this.font, "Use Current Facing", x + 4, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "Use Current Facing", x + 4, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(x, curY, useW, rowH, () -> drf.useCurrentFacingAsPearl(item)));
 
@@ -6574,7 +6929,7 @@ public class MainScreen extends Screen {
 				fillRounded(graphics, clx, curY, clx + clearW, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 				String clearLabel = "Clear (" + item.pearlShots.size() + ")";
 				graphics.enableScissor(clx, curY, clx + clearW, curY + rowH);
-				graphics.text(this.font, clearLabel, clx + 4, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, clearLabel, clx + 4, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(clx, curY, clearW, rowH, () -> drf.clearPearlShots(item)));
 				curY += rowH + 3;
@@ -6587,7 +6942,7 @@ public class MainScreen extends Screen {
 				int applyW = width - (fx - x);
 				fillRounded(graphics, fx, curY, fx + applyW, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 				String applyLabel = "Apply";
-				graphics.text(this.font, applyLabel, fx + (applyW - this.font.width(applyLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, applyLabel, fx + (applyW - this.textWidth(applyLabel)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(fx, curY, applyW, rowH, () -> drf.applyTypedPosition(item)));
 				curY += rowH + 3;
 			}
@@ -6601,7 +6956,7 @@ public class MainScreen extends Screen {
 				fillRounded(graphics, fx, curY, fx + useW, curY + rowH, SMALL_RADIUS, accent);
 				String label = "Use Looked-At Block";
 				graphics.enableScissor(fx, curY, fx + useW, curY + rowH);
-				graphics.text(this.font, label, fx + 4, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, label, fx + 4, curY + 4, Theme.text(0xFFFFFFFF));
 				graphics.disableScissor();
 				clickHits.add(new ClickHit(fx, curY, useW, rowH, () -> drf.useLookedAtPosition(item)));
 				curY += rowH + 3;
@@ -6616,7 +6971,7 @@ public class MainScreen extends Screen {
 				int useW = width - (fx - x);
 				fillRounded(graphics, fx, curY, fx + useW, curY + rowH, SMALL_RADIUS, accent);
 				String label = "Use Pos";
-				graphics.text(this.font, label, fx + (useW - this.font.width(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+				this.text(graphics, label, fx + (useW - this.textWidth(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(fx, curY, useW, rowH, () -> drf.useCurrentPosition(item)));
 				curY += rowH + 3;
 				curY = drawApplyPositionRow(graphics, x, curY, width, rowH, drf, item, accent);
@@ -6634,7 +6989,7 @@ public class MainScreen extends Screen {
 									  com.cokelord.skyblocksimplified.feature.impl.DungeonRoutesFeature.RouteItem item, int accent) {
 		fillRounded(graphics, x, curY, x + width, curY + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 		String label = "Apply Typed Coordinates";
-		graphics.text(this.font, label, x + (width - this.font.width(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
+		this.text(graphics, label, x + (width - this.textWidth(label)) / 2, curY + 4, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(x, curY, width, rowH, () -> drf.applyTypedPosition(item)));
 		return curY + rowH + 3;
 	}
@@ -6648,10 +7003,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty();
 		String display = !editing && empty ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6683,7 +7038,7 @@ public class MainScreen extends Screen {
 		int addH = 16;
 		fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + addH, BOX_RADIUS, accent);
 		String addLabel = "+ Add Alias";
-		graphics.text(this.font, addLabel, rowX + (rowWidth - this.font.width(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
+		this.text(graphics, addLabel, rowX + (rowWidth - this.textWidth(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(rowX, rowY, rowWidth, addH, caf::addAlias));
 		rowY += addH + 6;
 
@@ -6699,7 +7054,7 @@ public class MainScreen extends Screen {
 		int removeX = x + width - btnSize;
 		int removeY = y + 1;
 		fillCircle(graphics, removeX + btnSize / 2, removeY + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", removeX + (btnSize - this.font.width("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", removeX + (btnSize - this.textWidth("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(removeX, removeY, btnSize, btnSize, () -> caf.removeAlias(alias)));
 
 		int fieldWidth = width - btnSize - 6;
@@ -6719,10 +7074,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty() || value.equals("/");
 		String display = !editing && empty ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6745,7 +7100,7 @@ public class MainScreen extends Screen {
 		int addH = 16;
 		fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + addH, BOX_RADIUS, accent);
 		String addLabel = "+ Add Shortcut";
-		graphics.text(this.font, addLabel, rowX + (rowWidth - this.font.width(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
+		this.text(graphics, addLabel, rowX + (rowWidth - this.textWidth(addLabel)) / 2, rowY + 4, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(rowX, rowY, rowWidth, addH, csf::addShortcut));
 		rowY += addH + 6;
 
@@ -6761,7 +7116,7 @@ public class MainScreen extends Screen {
 		int removeX = x + width - btnSize;
 		int removeY = y + 1;
 		fillCircle(graphics, removeX + btnSize / 2, removeY + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", removeX + (btnSize - this.font.width("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", removeX + (btnSize - this.textWidth("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(removeX, removeY, btnSize, btnSize, () -> csf.removeShortcut(shortcut)));
 
 		int fieldWidth = width - btnSize - 6;
@@ -6781,10 +7136,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty() || value.equals("/");
 		String display = !editing && empty ? "Command to run" : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6801,10 +7156,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty();
 		String display = !editing && empty ? "e.g. 100K, 100,000" : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6829,10 +7184,10 @@ public class MainScreen extends Screen {
 		boolean empty = value.isEmpty();
 		String display = !editing && empty && placeholder != null ? placeholder : value;
 		if (editing) drawSelectionHighlight(graphics, value, boxX + 4, boxY + 2, boxHeight - 4);
-		graphics.text(this.font, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
+		this.text(graphics, display, boxX + 4, boxY + 4, !editing && empty ? COLOR_PLACEHOLDER_TEXT : 0xFFCCCCCC);
 		if (editing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, value.length()));
-			int caretX = boxX + 4 + this.font.width(value.substring(0, idx)) + 1;
+			int caretX = boxX + 4 + this.textWidth(value.substring(0, idx)) + 1;
 			graphics.fill(caretX, boxY + 3, caretX + 1, boxY + boxHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -6859,7 +7214,7 @@ public class MainScreen extends Screen {
 		int removeSize = 16;
 		int removeX = x + width - removeSize;
 		int presetGap = 4;
-		int presetButtonWidth = this.font.width("Preset") + 14;
+		int presetButtonWidth = this.textWidth("Preset") + 14;
 		int presetX = removeX - presetGap - presetButtonWidth;
 		boolean textEditing = textFocus == TextFocus.POSMSG_TEXT && editingPosMsgIndex == index;
 		int textBoxWidth = presetX - presetGap - x;
@@ -6867,17 +7222,17 @@ public class MainScreen extends Screen {
 		graphics.enableScissor(x, y, x + textBoxWidth, y + rowHeight);
 		String textDisplay = !textEditing && m.message.isEmpty() ? "(message text)" : m.message;
 		if (textEditing) drawSelectionHighlight(graphics, m.message, x + 4, y + 2, rowHeight - 4);
-		graphics.text(this.font, textDisplay, x + 4, y + 4, Theme.text(0xFFCCCCCC));
+		this.text(graphics, textDisplay, x + 4, y + 4, Theme.text(0xFFCCCCCC));
 		if (textEditing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, m.message.length()));
-			int caretX = x + 4 + this.font.width(m.message.substring(0, idx)) + 1;
+			int caretX = x + 4 + this.textWidth(m.message.substring(0, idx)) + 1;
 			graphics.fill(caretX, y + 3, caretX + 1, y + rowHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
 		posMsgFieldBoxes.add(new int[]{x, y, textBoxWidth, rowHeight, index, TextFocus.POSMSG_TEXT.ordinal()});
 
 		fillRounded(graphics, presetX, y, presetX + presetButtonWidth, y + rowHeight, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "Preset", presetX + (presetButtonWidth - this.font.width("Preset")) / 2, y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, "Preset", presetX + (presetButtonWidth - this.textWidth("Preset")) / 2, y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
 		int presetAnchorX = presetX, presetAnchorY = y;
 		clickHits.add(new ClickHit(presetX, y, presetButtonWidth, rowHeight, () -> {
 			posMsgDropdownIndex = index;
@@ -6888,7 +7243,7 @@ public class MainScreen extends Screen {
 		}));
 
 		fillCircle(graphics, removeX + removeSize / 2, y + removeSize / 2, removeSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", removeX + (removeSize - this.font.width("x")) / 2, y + (removeSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", removeX + (removeSize - this.textWidth("x")) / 2, y + (removeSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(removeX, y, removeSize, removeSize, () -> pmf.removeMessage(index)));
 
 		// Row 2: Classes / Section (both multi-select, checkmarked in their dropdowns) / Boss Part (cycle).
@@ -6899,7 +7254,7 @@ public class MainScreen extends Screen {
 		int classesX = x;
 		String classesLabel = m.classes.isEmpty() ? "Classes: ALL" : "Classes (" + m.classes.size() + ")";
 		fillRounded(graphics, classesX, row2Y, classesX + row2FieldWidth, row2Y + rowHeight, SMALL_RADIUS, m.classes.isEmpty() ? Theme.chrome(0xFF2A2A2A) : 0xFF3A5A3A);
-		graphics.text(this.font, classesLabel, classesX + (row2FieldWidth - this.font.width(classesLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, classesLabel, classesX + (row2FieldWidth - this.textWidth(classesLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
 		int classesAnchorX = classesX, classesAnchorY = row2Y;
 		clickHits.add(new ClickHit(classesX, row2Y, row2FieldWidth, rowHeight, () -> {
 			posMsgDropdownIndex = index;
@@ -6912,7 +7267,7 @@ public class MainScreen extends Screen {
 		int sectionX = classesX + row2FieldWidth + row2Gap;
 		String sectionLabel = m.sections.isEmpty() ? "Section: ALL" : "Section (" + m.sections.size() + ")";
 		fillRounded(graphics, sectionX, row2Y, sectionX + row2FieldWidth, row2Y + rowHeight, SMALL_RADIUS, m.sections.isEmpty() ? Theme.chrome(0xFF2A2A2A) : 0xFF3A5A3A);
-		graphics.text(this.font, sectionLabel, sectionX + (row2FieldWidth - this.font.width(sectionLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, sectionLabel, sectionX + (row2FieldWidth - this.textWidth(sectionLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
 		int sectionAnchorX = sectionX, sectionAnchorY = row2Y;
 		clickHits.add(new ClickHit(sectionX, row2Y, row2FieldWidth, rowHeight, () -> {
 			posMsgDropdownIndex = index;
@@ -6926,7 +7281,7 @@ public class MainScreen extends Screen {
 		String bossPartLabel = m.bossPart.label;
 		fillRounded(graphics, bossPartX, row2Y, bossPartX + row2FieldWidth, row2Y + rowHeight, SMALL_RADIUS,
 			m.bossPart == com.cokelord.skyblocksimplified.feature.impl.PositionalMessagesFeature.BossPart.ANY ? Theme.chrome(0xFF2A2A2A) : 0xFF3A5A3A);
-		graphics.text(this.font, bossPartLabel, bossPartX + (row2FieldWidth - this.font.width(bossPartLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, bossPartLabel, bossPartX + (row2FieldWidth - this.textWidth(bossPartLabel)) / 2, row2Y + (rowHeight - 8) / 2, Theme.text(0xFFDDDDDD));
 		clickHits.add(new ClickHit(bossPartX, row2Y, row2FieldWidth, rowHeight, () -> pmf.cycleBossPart(index)));
 
 		// Row 3: X/Y/Z/Range fields — already 1-decimal formatted (PositionalMessagesFeature.fmt), so kept
@@ -6945,13 +7300,13 @@ public class MainScreen extends Screen {
 			graphics.enableScissor(fieldX, row3Y, fieldX + fieldWidth, row3Y + rowHeight);
 			String label = labels[f];
 			String value = values[f];
-			int labelWidth = this.font.width(label);
+			int labelWidth = this.textWidth(label);
 			if (editing) drawSelectionHighlight(graphics, value, fieldX + 4 + labelWidth, row3Y + 2, rowHeight - 4);
-			graphics.text(this.font, label, fieldX + 4, row3Y + 4, Theme.text(0xFF888888));
-			graphics.text(this.font, value, fieldX + 4 + labelWidth, row3Y + 4, Theme.text(0xFFCCCCCC));
+			this.text(graphics, label, fieldX + 4, row3Y + 4, Theme.text(0xFF888888));
+			this.text(graphics, value, fieldX + 4 + labelWidth, row3Y + 4, Theme.text(0xFFCCCCCC));
 			if (editing && isCaretBlinkOn()) {
 				int idx = Math.max(0, Math.min(textCursor, value.length()));
-				int caretX = fieldX + 4 + labelWidth + this.font.width(value.substring(0, idx)) + 1;
+				int caretX = fieldX + 4 + labelWidth + this.textWidth(value.substring(0, idx)) + 1;
 				graphics.fill(caretX, row3Y + 3, caretX + 1, row3Y + rowHeight - 3, 0xFFFFFFFF);
 			}
 			graphics.disableScissor();
@@ -6963,7 +7318,7 @@ public class MainScreen extends Screen {
 		int row4Y = row3Y + rowHeight + rowGap;
 		fillRounded(graphics, x, row4Y, x + width, row4Y + rowHeight, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
 		String useLabel = "Use Current Position";
-		graphics.text(this.font, useLabel, x + (width - this.font.width(useLabel)) / 2, row4Y + 4, Theme.text(0xFFDDDDDD));
+		this.text(graphics, useLabel, x + (width - this.textWidth(useLabel)) / 2, row4Y + 4, Theme.text(0xFFDDDDDD));
 		clickHits.add(new ClickHit(x, row4Y, width, rowHeight, () -> { pmf.useCurrentPosition(index); ConfigManager.save(); }));
 
 		return row4Y + rowHeight;
@@ -7025,7 +7380,7 @@ public class MainScreen extends Screen {
 		int px = clampPopupX(popupAnchorX, popupWidth);
 		int py = clampPopupY(popupAnchorY, popupHeight);
 		fillRounded(graphics, px, py, px + popupWidth, py + popupHeight, BOX_RADIUS, 0xFF232323);
-		graphics.text(this.font, title, px + 8, py + 6, Theme.text(0xFFAAAAAA));
+		this.text(graphics, title, px + 8, py + 6, Theme.text(0xFFAAAAAA));
 
 		// Reserve a thin strip on the right for the scrollbar (only when actually scrollable) so row
 		// content/hit boxes never sit underneath it.
@@ -7038,9 +7393,9 @@ public class MainScreen extends Screen {
 			ry += rowHeight;
 			if (thisRy + rowHeight < py + listTop || thisRy > listBottom) continue;
 			fillRounded(graphics, px + 6, thisRy, rowRight, thisRy + rowHeight - 2, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-			graphics.text(this.font, row.label(), px + 10, thisRy + 3, Theme.text(0xFFDDDDDD));
+			this.text(graphics, row.label(), px + 10, thisRy + 3, Theme.text(0xFFDDDDDD));
 			if (row.checked()) {
-				graphics.text(this.font, "x", rowRight - 12, thisRy + 3, accent);
+				this.text(graphics, "x", rowRight - 12, thisRy + 3, accent);
 			}
 			clickHits.add(new ClickHit(px + 6, Math.max(thisRy, py + listTop), rowRight - (px + 6),
 				Math.min(thisRy + rowHeight - 2, listBottom) - Math.max(thisRy, py + listTop), () -> {
@@ -7094,7 +7449,7 @@ public class MainScreen extends Screen {
 
 		int removeX = cursorX, removeY = rowTop + 2;
 		fillCircle(graphics, removeX + btnSize / 2, removeY + btnSize / 2, btnSize / 2, COLOR_CLOSE_BUTTON);
-		graphics.text(this.font, "x", removeX + (btnSize - this.font.width("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "x", removeX + (btnSize - this.textWidth("x")) / 2, removeY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(removeX, removeY, btnSize, btnSize, () -> { cef.removeRule(index); ConfigManager.save(); }));
 		cursorX -= btnSize + btnGap;
 
@@ -7111,13 +7466,13 @@ public class MainScreen extends Screen {
 
 		int tiltX = cursorX, tiltY = rowTop + 2;
 		fillRounded(graphics, tiltX, tiltY, tiltX + btnSize, tiltY + btnSize, SMALL_RADIUS, rule.tilted ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "/", tiltX + (btnSize - this.font.width("/")) / 2, tiltY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "/", tiltX + (btnSize - this.textWidth("/")) / 2, tiltY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(tiltX, tiltY, btnSize, btnSize, () -> { rule.tilted = !rule.tilted; ConfigManager.save(); }));
 		cursorX -= btnSize + btnGap;
 
 		int chromaX = cursorX, chromaY = rowTop + 2;
 		fillRounded(graphics, chromaX, chromaY, chromaX + btnSize, chromaY + btnSize, SMALL_RADIUS, rule.chromaEnabled ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "R", chromaX + (btnSize - this.font.width("R")) / 2, chromaY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "R", chromaX + (btnSize - this.textWidth("R")) / 2, chromaY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		int chromaPopupX = chromaX, chromaPopupY = chromaY;
 		clickHits.add(new ClickHit(chromaX, chromaY, btnSize, btnSize, () -> {
 			enchantChromaPopupTarget = rule;
@@ -7129,7 +7484,7 @@ public class MainScreen extends Screen {
 
 		int boldX = cursorX, boldY = rowTop + 2;
 		fillRounded(graphics, boldX, boldY, boldX + btnSize, boldY + btnSize, SMALL_RADIUS, rule.bold ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "B", boldX + (btnSize - this.font.width("B")) / 2, boldY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "B", boldX + (btnSize - this.textWidth("B")) / 2, boldY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(boldX, boldY, btnSize, btnSize, () -> { rule.bold = !rule.bold; ConfigManager.save(); }));
 		cursorX -= btnSize + btnGap + 4;
 
@@ -7138,10 +7493,10 @@ public class MainScreen extends Screen {
 		fillRounded(graphics, levelBoxX, rowTop, levelBoxX + levelBoxWidth, rowTop + rowHeight, SMALL_RADIUS, levelEditing ? Theme.chrome(0xFF3A3A3A) : Theme.chrome(0xFF262626));
 		graphics.enableScissor(levelBoxX, rowTop, levelBoxX + levelBoxWidth, rowTop + rowHeight);
 		if (levelEditing) drawSelectionHighlight(graphics, rule.levelInput, levelBoxX + 4, rowTop + 2, rowHeight - 4);
-		graphics.text(this.font, rule.levelInput, levelBoxX + 4, rowTop + 4, Theme.text(0xFFCCCCCC));
+		this.text(graphics, rule.levelInput, levelBoxX + 4, rowTop + 4, Theme.text(0xFFCCCCCC));
 		if (levelEditing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, rule.levelInput.length()));
-			int caretX = levelBoxX + 4 + this.font.width(rule.levelInput.substring(0, idx)) + 1;
+			int caretX = levelBoxX + 4 + this.textWidth(rule.levelInput.substring(0, idx)) + 1;
 			graphics.fill(caretX, rowTop + 3, caretX + 1, rowTop + rowHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -7153,10 +7508,10 @@ public class MainScreen extends Screen {
 		graphics.enableScissor(nameBoxX, rowTop, nameBoxX + nameBoxWidth, rowTop + rowHeight);
 		String nameDisplay = !nameEditing && rule.name.isEmpty() ? "(enchant name)" : rule.name;
 		if (nameEditing) drawSelectionHighlight(graphics, rule.name, nameBoxX + 4, rowTop + 2, rowHeight - 4);
-		graphics.text(this.font, nameDisplay, nameBoxX + 4, rowTop + 4, Theme.text(0xFFCCCCCC));
+		this.text(graphics, nameDisplay, nameBoxX + 4, rowTop + 4, Theme.text(0xFFCCCCCC));
 		if (nameEditing && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, rule.name.length()));
-			int caretX = nameBoxX + 4 + this.font.width(rule.name.substring(0, idx)) + 1;
+			int caretX = nameBoxX + 4 + this.textWidth(rule.name.substring(0, idx)) + 1;
 			graphics.fill(caretX, rowTop + 3, caretX + 1, rowTop + rowHeight - 3, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -7180,13 +7535,13 @@ public class MainScreen extends Screen {
 
 		int tiltX = cursorX, tiltY = rowTop + 2;
 		fillRounded(graphics, tiltX, tiltY, tiltX + btnSize, tiltY + btnSize, SMALL_RADIUS, tier.tilted ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "/", tiltX + (btnSize - this.font.width("/")) / 2, tiltY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "/", tiltX + (btnSize - this.textWidth("/")) / 2, tiltY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(tiltX, tiltY, btnSize, btnSize, () -> { tier.tilted = !tier.tilted; ConfigManager.save(); }));
 		cursorX -= btnSize + btnGap;
 
 		int boldX = cursorX, boldY = rowTop + 2;
 		fillRounded(graphics, boldX, boldY, boldX + btnSize, boldY + btnSize, SMALL_RADIUS, tier.bold ? accent : Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, "B", boldX + (btnSize - this.font.width("B")) / 2, boldY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+		this.text(graphics, "B", boldX + (btnSize - this.textWidth("B")) / 2, boldY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		clickHits.add(new ClickHit(boldX, boldY, btnSize, btnSize, () -> { tier.bold = !tier.bold; ConfigManager.save(); }));
 		cursorX -= btnSize + btnGap;
 
@@ -7204,11 +7559,11 @@ public class MainScreen extends Screen {
 		fillRounded(graphics, enableX, enableY, enableX + btnSize, enableY + btnSize, SMALL_RADIUS, tier.enabled ? accent : Theme.chrome(0xFF2A2A2A));
 		if (tier.enabled) {
 			String check = "✓";
-			graphics.text(this.font, check, enableX + (btnSize - this.font.width(check)) / 2, enableY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+			this.text(graphics, check, enableX + (btnSize - this.textWidth(check)) / 2, enableY + (btnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 		}
 		clickHits.add(new ClickHit(enableX, enableY, btnSize, btnSize, () -> { tier.enabled = !tier.enabled; ConfigManager.save(); }));
 
-		graphics.text(this.font, "Level " + level, x + 14, rowTop + 4, Theme.text(tier.enabled ? 0xFFDDDDDD : 0xFF888888));
+		this.text(graphics, "Level " + level, x + 14, rowTop + 4, Theme.text(tier.enabled ? 0xFFDDDDDD : 0xFF888888));
 
 		return rowTop + rowHeight;
 	}
@@ -7309,7 +7664,7 @@ public class MainScreen extends Screen {
 			int py = clampPopupY(popupAnchorY, popupHeight);
 			fillRounded(graphics, px, py, px + popupWidth, py + popupHeight, BOX_RADIUS, 0xFF232323);
 			String header = item.blocks.isEmpty() ? "Nothing selected yet" : item.blocks.size() + " selected (relative)";
-			graphics.text(this.font, header, px + 8, py + 6, Theme.text(0xFFAAAAAA));
+			this.text(graphics, header, px + 8, py + 6, Theme.text(0xFFAAAAAA));
 			int ry = py + headerH;
 			for (net.minecraft.core.BlockPos pos : new ArrayList<>(item.blocks)) {
 				fillRounded(graphics, px + 6, ry, px + popupWidth - 6, ry + rowH, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
@@ -7317,11 +7672,11 @@ public class MainScreen extends Screen {
 				int xBtnSize = 12;
 				int xBtnX = px + popupWidth - 6 - xBtnSize - 2;
 				graphics.enableScissor(px + 8, ry, xBtnX - 2, ry + rowH);
-				graphics.text(this.font, posLabel, px + 8, ry + 4, Theme.text(0xFFDDDDDD));
+				this.text(graphics, posLabel, px + 8, ry + 4, Theme.text(0xFFDDDDDD));
 				graphics.disableScissor();
 				int xBtnY = ry + (rowH - xBtnSize) / 2;
 				fillCircle(graphics, xBtnX + xBtnSize / 2, xBtnY + xBtnSize / 2, xBtnSize / 2, COLOR_CLOSE_BUTTON);
-				graphics.text(this.font, "x", xBtnX + (xBtnSize - this.font.width("x")) / 2, xBtnY + (xBtnSize - 8) / 2, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "x", xBtnX + (xBtnSize - this.textWidth("x")) / 2, xBtnY + (xBtnSize - 8) / 2, Theme.text(0xFFFFFFFF));
 				clickHits.add(new ClickHit(xBtnX, xBtnY, xBtnSize, xBtnSize, () -> {
 					item.blocks.remove(pos);
 					ConfigManager.save();
@@ -7339,7 +7694,7 @@ public class MainScreen extends Screen {
 			case WAYPOINT -> item.waypointColor;
 			case DEVICE_FINISHED -> item.blockColor;
 			case LEAP_USED -> item.blockColor;
-			case TERMINAL_DONE -> item.blockColor;
+			case TERMINAL_DONE, RELIC_PICKED_UP, RELIC_PLACED, DRAGON_DEAD -> item.blockColor;
 			case BLOCK_WATCH -> item.blockColor;
 			case LEVER_FLIPPED -> item.blockColor;
 		};
@@ -7352,7 +7707,7 @@ public class MainScreen extends Screen {
 			case WAYPOINT -> item.waypointColor = (item.waypointColor & 0xFF000000) | (rgb & 0xFFFFFF);
 			case DEVICE_FINISHED -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
 			case LEAP_USED -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
-			case TERMINAL_DONE -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
+			case TERMINAL_DONE, RELIC_PICKED_UP, RELIC_PLACED, DRAGON_DEAD -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
 			case BLOCK_WATCH -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
 			case LEVER_FLIPPED -> item.blockColor = (item.blockColor & 0xFF000000) | (rgb & 0xFFFFFF);
 		}
@@ -7370,13 +7725,13 @@ public class MainScreen extends Screen {
 		int boxSize = 9;
 		int cx = x;
 		for (int i = 0; i < labels.length; i++) {
-			graphics.text(this.font, labels[i], cx, y, Theme.text(0xFFAAAAAA));
-			int labelWidth = this.font.width(labels[i]);
+			this.text(graphics, labels[i], cx, y, Theme.text(0xFFAAAAAA));
+			int labelWidth = this.textWidth(labels[i]);
 			int boxX = cx + labelWidth + 3;
 			int boxY = y - 1;
 			fillRounded(graphics, boxX, boxY, boxX + boxSize, boxY + boxSize, SMALL_RADIUS, values[i] ? accent : Theme.chrome(0xFF2A2A2A));
 			if (values[i]) {
-				graphics.text(this.font, "x", boxX + 1, boxY - 1, Theme.text(0xFFFFFFFF));
+				this.text(graphics, "x", boxX + 1, boxY - 1, Theme.text(0xFFFFFFFF));
 			}
 			clickHits.add(new ClickHit(boxX, boxY, boxSize, boxSize, actions[i]));
 			cx = boxX + boxSize + 8;
@@ -7402,11 +7757,11 @@ public class MainScreen extends Screen {
 		// Gap sized off the widest label ("Speed") so labels don't overlap their neighbors — a fixed
 		// small gap looked "next to each other" as asked, but was tight enough to overlap the text.
 		int widestLabel = 0;
-		for (String label : labels) widestLabel = Math.max(widestLabel, this.font.width(label));
+		for (String label : labels) widestLabel = Math.max(widestLabel, this.textWidth(label));
 		int gap = Math.max(8, widestLabel - sliderWidth + 6);
 		for (int i = 0; i < labels.length; i++) {
 			int sx = x + i * (sliderWidth + gap);
-			graphics.text(this.font, labels[i], sx + (sliderWidth - this.font.width(labels[i])) / 2, y, Theme.text(0xFFAAAAAA));
+			this.text(graphics, labels[i], sx + (sliderWidth - this.textWidth(labels[i])) / 2, y, Theme.text(0xFFAAAAAA));
 			int trackY = y + 11;
 			String sliderKey = keyPrefix + "_" + labels[i];
 			drawVerticalSlider(graphics, sliderKey, sx, trackY, sliderWidth, trackHeight, values01[i], accent);
@@ -7434,7 +7789,7 @@ public class MainScreen extends Screen {
 			// rendering the literal "key.skyblocksimplified.loadout_slot_N" string instead of resolving
 			// it through the lang file (which does have the right "Slot N" entries).
 			String label = net.minecraft.client.resources.language.I18n.get(keyMapping.getName());
-			graphics.text(this.font, label, x + 10, slotY + 3, Theme.text(0xFFAAAAAA));
+			this.text(graphics, label, x + 10, slotY + 3, Theme.text(0xFFAAAAAA));
 
 			boolean listening = keyMapping == listeningFor;
 			String bound = listening ? "press a key..." : (keyMapping.isUnbound() ? "unbound" : keyMapping.getTranslatedKeyMessage().getString());
@@ -7443,7 +7798,7 @@ public class MainScreen extends Screen {
 			// Was slotY + 5, which — against this row's 14px height and the font's 9px line height —
 			// left only a 0px gap below the text vs. a 5px gap above it, reading as "stuck to the
 			// bottom" per user report. slotY + 3 centers it (14 - 9 = 5, so 2-3px on each side).
-			graphics.text(this.font, bound, buttonX + (buttonWidth - this.font.width(bound)) / 2, slotY + 3, Theme.text(0xFFDDDDDD));
+			this.text(graphics, bound, buttonX + (buttonWidth - this.textWidth(bound)) / 2, slotY + 3, Theme.text(0xFFDDDDDD));
 
 			if (slotY >= y && slotY + SLOT_SIZE <= y + height) {
 				slotRows.add(new SlotRow(keyMapping, buttonX, slotY, buttonWidth, SLOT_SIZE, true));
@@ -7451,6 +7806,169 @@ public class MainScreen extends Screen {
 			slotY += SLOT_ROW_HEIGHT;
 		}
 		return slotY;
+	}
+
+	// ---- Color swatch row: label + small color square; clicking the square opens a full hex/color picker
+	// right under it (clicking it again closes it). Height via swatchRowHeight(key) — keep both in sync.
+	private final java.util.Set<String> openSwatchPickers = new java.util.HashSet<>();
+
+	private int swatchRowHeight(String key) {
+		return 18 + (openSwatchPickers.contains(key) ? 4 + COLOR_CONTENT_HEIGHT + 8 : 0);
+	}
+
+	private int drawColorSwatchRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, String key, int accent,
+									java.util.function.IntSupplier get, java.util.function.IntConsumer set, int defaultColor) {
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
+		boolean open = openSwatchPickers.contains(key);
+		int size = 12;
+		int sx = x + width - size - 1, sy = y - 1;
+		fillRounded(graphics, sx - 1, sy - 1, sx + size + 1, sy + size + 1, SMALL_RADIUS, open ? accent | 0xFF000000 : Theme.chrome(0xFF3A3A3A));
+		fillRounded(graphics, sx, sy, sx + size, sy + size, SMALL_RADIUS, get.getAsInt() | 0xFF000000);
+		clickHits.add(new ClickHit(sx - 1, sy - 1, size + 2, size + 2, () -> {
+			if (!openSwatchPickers.remove(key)) openSwatchPickers.add(key);
+		}));
+		if (open) {
+			drawFullColorPicker(graphics, x, y + 18 + 4, width, key, COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
+				get, c -> { set.accept(c); ConfigManager.save(); }, defaultColor);
+		}
+		return y + swatchRowHeight(key);
+	}
+
+	// ---- Generic declarative settings rows (see feature/SettingRow). Height and drawing walk the same list
+	// in the same order with the same per-row sizes — keep settingRowHeight and drawSettingRow in sync.
+	private final java.util.Set<String> openSettingGroups = new java.util.HashSet<>();
+	private int settingRowsWrapWidth = 300;
+
+	private float settingRowsHeight(List<com.cokelord.skyblocksimplified.feature.SettingRow> rows) {
+		float h = 0;
+		for (var row : rows) {
+			if (!row.visible().getAsBoolean()) continue;
+			h += settingRowHeight(row);
+		}
+		return h;
+	}
+
+	private float settingRowHeight(com.cokelord.skyblocksimplified.feature.SettingRow row) {
+		return switch (row) {
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Toggle t -> 18;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Slider sl -> 23;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Cycle c -> 20;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Color c -> 4 + 10 + COLOR_CONTENT_HEIGHT + 8;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Text t -> 12 + 16 + 8;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Keybind k -> 20;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Button b -> 22;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Note n -> wrapSettingNote(n.text(), settingRowsWrapWidth).size() * 10 + 6;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Sound so -> expandedSoundOptionHeight(so.sound()) + 4;
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Group g -> 18
+				+ (openSettingGroups.contains(g.key()) ? settingRowsHeight(g.children()) + 4 : 0);
+		};
+	}
+
+	private int drawSettingRows(GuiGraphicsExtractor graphics, List<com.cokelord.skyblocksimplified.feature.SettingRow> rows,
+								 int x, int y, int width, int accent, String keyPrefix) {
+		for (var row : rows) {
+			if (!row.visible().getAsBoolean()) continue;
+			int start = y;
+			drawSettingRow(graphics, row, x, y, width, accent, keyPrefix);
+			y = start + Math.round(settingRowHeight(row));
+		}
+		return y;
+	}
+
+	private void drawSettingRow(GuiGraphicsExtractor graphics, com.cokelord.skyblocksimplified.feature.SettingRow row,
+								 int x, int y, int width, int accent, String keyPrefix) {
+		switch (row) {
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Toggle t -> {
+				boolean value = t.get().getAsBoolean();
+				drawToggleRow(graphics, x, y, width, keyPrefix + "/" + t.label(), t.label(), value,
+					() -> { t.set().accept(!value); ConfigManager.save(); }, t.tooltip());
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Slider sl -> {
+				int value = sl.get().getAsInt();
+				int range = Math.max(1, sl.max() - sl.min());
+				drawSliderRow(graphics, x, y, width, sl.label(), value + sl.suffix(), (value - sl.min()) / (float) range,
+					v -> { sl.set().accept(sl.min() + Math.round(v * range)); ConfigManager.save(); }, accent, sl.tooltip());
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Cycle c ->
+				drawCycleRow(graphics, x, y, width, c.label(), c.value().get(), () -> { c.next().run(); ConfigManager.save(); }, c.tooltip());
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Color c -> {
+				colorPickerLabel(graphics, x, y + 4, c.label());
+				drawFullColorPicker(graphics, x, y + 14, width, c.key(), COLOR_SQUARE_SIZE, COLOR_SQUARE_CELLS, accent,
+					c.get(), v -> { c.set().accept(v); ConfigManager.save(); }, c.defaultColor());
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Text t -> {
+				this.text(graphics, t.label(), x, y, Theme.text(0xFFAAAAAA));
+				drawGenericTextField(graphics, t.id(), x, y + 12, width, 16, t.placeholder(), t.get(),
+					v -> { t.set().accept(v); ConfigManager.save(); });
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Keybind k -> drawComboCaptureRow(graphics, x, y + 2, width, k.label(), k.combo());
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Button b -> {
+				fillRounded(graphics, x, y, x + width, y + 16, BOX_RADIUS, Theme.chrome(0xFF2A2A2A));
+				this.text(graphics, b.label(), x + (width - this.textWidth(b.label())) / 2, y + 4, Theme.text(0xFFDDDDDD));
+				clickHits.add(new ClickHit(x, y, width, 16, b.action()));
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Sound so -> drawSoundOptionRows(graphics, x, y, width, accent, so.sound());
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Note n -> {
+				int ly = y;
+				for (String line : wrapSettingNote(n.text(), width)) {
+					this.text(graphics, line, x, ly, Theme.text(0xFF888888));
+					ly += 10;
+				}
+			}
+			case com.cokelord.skyblocksimplified.feature.SettingRow.Group g -> {
+				boolean open = openSettingGroups.contains(g.key());
+				String arrow = open ? "▾ " : "▸ ";
+				fillRounded(graphics, x, y - 2, x + width, y + 13, BOX_RADIUS, Theme.chrome(0xFF232323));
+				this.text(graphics, arrow + g.label(), x + 4, y + 1, Theme.text(0xFFCCCCCC));
+				clickHits.add(new ClickHit(x, y - 2, width, 15, () -> {
+					if (!openSettingGroups.remove(g.key())) openSettingGroups.add(g.key());
+				}));
+				if (open) drawSettingRows(graphics, g.children(), x + 8, y + 18, width - 8, accent, keyPrefix + "/" + g.key());
+			}
+		}
+	}
+
+	private List<String> wrapSettingNote(String text, int width) {
+		List<String> lines = new ArrayList<>();
+		for (String paragraph : text.split("\n")) {
+			StringBuilder line = new StringBuilder();
+			for (String word : paragraph.split(" ")) {
+				String candidate = line.isEmpty() ? word : line + " " + word;
+				if (!line.isEmpty() && this.textWidth(candidate) > width) {
+					lines.add(line.toString());
+					line = new StringBuilder(word);
+				} else {
+					line = new StringBuilder(candidate);
+				}
+			}
+			lines.add(line.toString());
+		}
+		return lines;
+	}
+
+	private String[] genericSettingLabels(Feature feature) {
+		List<com.cokelord.skyblocksimplified.feature.SettingRow> rows = feature.getSettingRows();
+		if (rows.isEmpty()) return null;
+		List<String> labels = new ArrayList<>();
+		collectSettingLabels(rows, labels);
+		return labels.toArray(new String[0]);
+	}
+
+	private void collectSettingLabels(List<com.cokelord.skyblocksimplified.feature.SettingRow> rows, List<String> out) {
+		for (var row : rows) {
+			switch (row) {
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Toggle t -> out.add(t.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Slider sl -> out.add(sl.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Cycle c -> out.add(c.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Color c -> out.add(c.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Text t -> out.add(t.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Keybind k -> out.add(k.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Button b -> out.add(b.label());
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Note n -> {}
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Sound so -> out.add("Sound");
+				case com.cokelord.skyblocksimplified.feature.SettingRow.Group g -> { out.add(g.label()); collectSettingLabels(g.children(), out); }
+			}
+		}
 	}
 
 	private int drawToggleRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, boolean value, Runnable onToggle) {
@@ -7481,7 +7999,7 @@ public class MainScreen extends Screen {
 	 *  displayed label text — every pre-existing single-label caller still gets an animKey equal to its own
 	 *  label via the overload above, so nothing else regresses. */
 	private int drawToggleRow(GuiGraphicsExtractor graphics, int x, int y, int width, String animKey, String label, boolean value, Runnable onToggle, String tooltip) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		int toggleW = 28, toggleH = 12;
 		int tx = x + width - toggleW;
 		int ty = y - 1;
@@ -7501,18 +8019,18 @@ public class MainScreen extends Screen {
 	 *  never actually be bound through the UI at all — the real "right-click chat to copy does nothing"
 	 *  bug, since its combo could never be captured in the first place). */
 	private int drawComboCaptureRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, KeyCombo combo) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		boolean listening = combo == listeningForCombo;
 		String valueLabel = listening ? comboCaptureLabel() : (combo.isEmpty() ? "NONE" : combo.getDisplayName());
-		int boxWidth = Math.max(70, this.font.width(valueLabel) + 10);
+		int boxWidth = Math.max(70, this.textWidth(valueLabel) + 10);
 		int boxHeight = 14;
 		int bx = x + width - boxWidth;
 		int by = y - 2;
 		fillRounded(graphics, bx, by, bx + boxWidth, by + boxHeight, BOX_RADIUS, listening ? colorKeybindListening() : colorKeybindBox());
 		// See drawCycleRow's own doc comment on the same fix — every boxed value centers now, not just
 		// left-aligns with a fixed inset.
-		int comboTextX = bx + Math.max(0, (boxWidth - this.font.width(valueLabel)) / 2);
-		graphics.text(this.font, valueLabel, comboTextX, by + 3, Theme.text(0xFFDDDDDD));
+		int comboTextX = bx + Math.max(0, (boxWidth - this.textWidth(valueLabel)) / 2);
+		this.text(graphics, valueLabel, comboTextX, by + 3, Theme.text(0xFFDDDDDD));
 		comboRows.add(new ComboRow(combo, bx, by, boxWidth, boxHeight));
 		return y + 18;
 	}
@@ -7542,7 +8060,7 @@ public class MainScreen extends Screen {
 	 *  not get overwritten by the next chroma tick). Hovering shows the preset's name via the shared
 	 *  tooltip queue. */
 	private int drawAccentPresetsRow(GuiGraphicsExtractor graphics, GuiColorFeature gcf, int x, int y, int width, int mouseX, int mouseY) {
-		graphics.text(this.font, "Accent Presets", x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, "Accent Presets", x, y, Theme.text(0xFFAAAAAA));
 		int size = COLOR_SWATCH_SIZE;
 		int gap = 4;
 		int count = ACCENT_PRESET_COLORS.length;
@@ -7579,7 +8097,7 @@ public class MainScreen extends Screen {
 
 	/** Tooltip-aware overload — see {@link #drawToggleRow(GuiGraphicsExtractor, int, int, int, String, boolean, Runnable, String)}'s doc comment. */
 	private int drawColorCycleRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, int currentColor, java.util.function.IntConsumer onChange, String tooltip) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		int size = COLOR_SWATCH_SIZE;
 		int sx = x + width - size;
 		int sy = y - 2;
@@ -7675,11 +8193,11 @@ public class MainScreen extends Screen {
 			float handLen = gradientDialR - 5;
 			RenderUtil.drawLine(graphics, gradientDialCx, gradientDialCy, gradientDialCx + hx * handLen, gradientDialCy + hy * handLen, 2f, accent);
 			fillCircle(graphics, gradientDialCx, gradientDialCy, 3, accent);
-			graphics.text(this.font, Math.round(angle) + "°", rightX, y + dialD + 4, Theme.text(0xFFAAAAAA));
+			this.text(graphics, Math.round(angle) + "°", rightX, y + dialD + 4, Theme.text(0xFFAAAAAA));
 		} else {
 			gradientDialActiveThisFrame = false;
-			graphics.text(this.font, "Feathered", rightX, y, Theme.text(0xFFAAAAAA));
-			graphics.text(this.font, "Circle", rightX, y + 10, Theme.text(0xFFAAAAAA));
+			this.text(graphics, "Feathered", rightX, y, Theme.text(0xFFAAAAAA));
+			this.text(graphics, "Circle", rightX, y + 10, Theme.text(0xFFAAAAAA));
 		}
 
 		// Real direction vector — RADIAL has no meaningful angle of its own, so its pins sit along a fixed
@@ -7766,9 +8284,14 @@ public class MainScreen extends Screen {
 	}
 
 	private static void cyclePanelTheme(com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature ptf) {
-		com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode[] modes =
-			com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode.values();
-		ptf.setMode(modes[(ptf.getMode().ordinal() + 1) % modes.length]);
+		// Per user request ("Remove custom theme aswell i have bigger plans for it later"): Custom is no longer
+		// selectable — only Black / White / Transparent cycle. Its code stays dormant in PanelThemeFeature.
+		com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode[] modes = {
+			com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode.BLACK,
+			com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode.WHITE,
+			com.cokelord.skyblocksimplified.feature.impl.PanelThemeFeature.Mode.TRANSPARENT};
+		int current = java.util.Arrays.asList(modes).indexOf(ptf.getMode());
+		ptf.setMode(modes[(current + 1) % modes.length]);
 	}
 
 	private static void cycleCatacombsFloor(com.cokelord.skyblocksimplified.feature.impl.CatacombsExpCalculatorFeature cef) {
@@ -7783,10 +8306,10 @@ public class MainScreen extends Screen {
 	 *  colored runs, not one shared-color string like the mod's earlier version had. */
 	private int drawCatacombsStatusLine(GuiGraphicsExtractor graphics, int x, int y, String label, int labelColor, boolean active) {
 		String prefix = label + ": ";
-		graphics.text(this.font, prefix, x, y, Theme.text(labelColor));
+		this.text(graphics, prefix, x, y, Theme.text(labelColor));
 		String mark = active ? "✓" : "✗";
 		int markColor = active ? 0xFF55FF55 : 0xFFFF5555;
-		graphics.text(this.font, mark, x + this.font.width(prefix), y, Theme.text(markColor));
+		this.text(graphics, mark, x + this.textWidth(prefix), y, Theme.text(markColor));
 		return y + 14;
 	}
 
@@ -7794,7 +8317,7 @@ public class MainScreen extends Screen {
 	 *  generic gray every other toggle row hardcodes — needed for the Catacombs Expert Ring toggle, whose label
 	 *  should read in Hypixel's own Epic rarity color like every other auto-detected bonus on that panel. */
 	private int drawColoredToggleRow(GuiGraphicsExtractor graphics, int x, int y, int width, String animKey, String label, int labelColor, boolean value, Runnable onToggle) {
-		graphics.text(this.font, label, x, y, Theme.text(labelColor));
+		this.text(graphics, label, x, y, Theme.text(labelColor));
 		int toggleW = 28, toggleH = 12;
 		int tx = x + width - toggleW;
 		int ty = y - 1;
@@ -7993,14 +8516,14 @@ public class MainScreen extends Screen {
 	/** Tooltip-aware overload — see {@link #drawToggleRow(GuiGraphicsExtractor, int, int, int, String, boolean, Runnable, String)}'s doc comment. */
 	private int drawSliderRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, String valueText,
 							   float value01, Consumer<Float> onChange, int accent, String tooltip) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		// Real bug found (per user report — "no gap between the columns and the slider"): the slider used to
 		// start only 11px below the label, tight enough it visually ran straight into the bar with no
 		// breathing room. Also centers the numeric readout within its own reserved column (see this class's
 		// own "center every value in its box" pass) instead of just anchoring it at a fixed left edge.
 		int valueColumnX = x + width - 50;
-		int valueWidth = Math.max(50, this.font.width(valueText) + 4);
-		graphics.text(this.font, valueText, valueColumnX + Math.max(0, (valueWidth - this.font.width(valueText)) / 2), y, Theme.text(0xFF888888));
+		int valueWidth = Math.max(50, this.textWidth(valueText) + 4);
+		this.text(graphics, valueText, valueColumnX + Math.max(0, (valueWidth - this.textWidth(valueText)) / 2), y, Theme.text(0xFF888888));
 		int sliderY = y + 14;
 		int sliderWidth = width - 60;
 		drawHorizontalSlider(graphics, label, x, sliderY, sliderWidth, 5, value01, accent);
@@ -8032,19 +8555,19 @@ public class MainScreen extends Screen {
 
 	/** Tooltip-aware master implementation — see {@link #drawToggleRow(GuiGraphicsExtractor, int, int, int, String, boolean, Runnable, String)}'s doc comment. */
 	private int drawCycleRow(GuiGraphicsExtractor graphics, int x, int y, int width, String label, String valueText, Runnable onClick, Runnable onPlay, String tooltip) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		// Real bug found (per user report — "the holding spirit leap text when cycling goes off the little
 		// box it uses"): this box used to be a flat 90px regardless of what valueText actually needed, which
 		// overflowed for anything longer than that (e.g. "Holding Spirit Leap"). Sized to the real text now,
 		// with 90 kept only as a floor so short values (existing call sites) don't shrink the row.
-		int boxW = Math.max(90, this.font.width(valueText) + 12), boxH = 14;
+		int boxW = Math.max(90, this.textWidth(valueText) + 12), boxH = 14;
 		int bx = x + width - boxW;
 		int by = y - 2;
 		if (onPlay != null) {
 			int playW = 16;
 			int playX = bx - 4 - playW;
 			fillRounded(graphics, playX, by, playX + playW, by + boxH, BOX_RADIUS, Theme.chrome(0xFF2A2A2A));
-			graphics.text(this.font, "▶", playX + (playW - this.font.width("▶")) / 2, by + 3, 0xFFAAFFAA);
+			this.text(graphics, "▶", playX + (playW - this.textWidth("▶")) / 2, by + 3, 0xFFAAFFAA);
 			clickHits.add(new ClickHit(playX, by, playW, boxH, onPlay));
 		}
 		fillRounded(graphics, bx, by, bx + boxW, by + boxH, BOX_RADIUS, Theme.chrome(0xFF2A2A2A));
@@ -8052,8 +8575,8 @@ public class MainScreen extends Screen {
 		// within the box"): valueText used to always sit flush against the box's left edge instead of
 		// centered — visible whenever boxW's own text-plus-12px sizing left slack (the exact-fit case masked
 		// it). Centered both axes now, matching this class's own "every value centers in its box" pass.
-		int textX = bx + Math.max(0, (boxW - this.font.width(valueText)) / 2);
-		graphics.text(this.font, valueText, textX, by + 3, Theme.text(0xFFDDDDDD));
+		int textX = bx + Math.max(0, (boxW - this.textWidth(valueText)) / 2);
+		this.text(graphics, valueText, textX, by + 3, Theme.text(0xFFDDDDDD));
 		clickHits.add(new ClickHit(bx, by, boxW, boxH, onClick));
 		if (tooltip != null) checkHoverTooltip(lastMouseX, lastMouseY, x, y - 2, width, 20, "cycle_" + label, tooltip);
 		return y + 20;
@@ -8081,7 +8604,7 @@ public class MainScreen extends Screen {
 			// .au all work.
 			String importLabel = sound.getCustomFilePath() != null ? "Re-import Sound" : "Import Sound";
 			fillRounded(graphics, rowX, rowY, rowX + rowWidth, rowY + btnHeight, BOX_RADIUS, Theme.chrome(0xFF2A2A2A));
-			graphics.text(this.font, importLabel, rowX + (rowWidth - this.font.width(importLabel)) / 2, rowY + 5, Theme.text(0xFFFFFFFF));
+			this.text(graphics, importLabel, rowX + (rowWidth - this.textWidth(importLabel)) / 2, rowY + 5, Theme.text(0xFFFFFFFF));
 			int importY = rowY;
 			clickHits.add(new ClickHit(rowX, importY, rowWidth, btnHeight, () -> {
 				String picked;
@@ -8100,7 +8623,7 @@ public class MainScreen extends Screen {
 			rowY += btnHeight + 4;
 			if (sound.getCustomFilePath() != null) {
 				String fileName = new java.io.File(sound.getCustomFilePath()).getName();
-				graphics.text(this.font, fileName, rowX, rowY, Theme.text(0xFF888888));
+				this.text(graphics, fileName, rowX, rowY, Theme.text(0xFF888888));
 				rowY += 12;
 				// Per user request ("Replace the 'Preview sound' button with a 'Stop playing' button when
 				// the sound is active in the mod menu"): same button, swaps label/action based on whether
@@ -8109,7 +8632,7 @@ public class MainScreen extends Screen {
 				String previewLabel = playing ? "Stop" : "Preview";
 				int previewWidth = 60;
 				fillRounded(graphics, rowX, rowY, rowX + previewWidth, rowY + btnHeight, BOX_RADIUS, playing ? 0xFFAA3333 : accent);
-				graphics.text(this.font, previewLabel, rowX + (previewWidth - this.font.width(previewLabel)) / 2, rowY + 5, 0xFFFFFFFF);
+				this.text(graphics, previewLabel, rowX + (previewWidth - this.textWidth(previewLabel)) / 2, rowY + 5, 0xFFFFFFFF);
 				int previewY = rowY;
 				clickHits.add(new ClickHit(rowX, previewY, previewWidth, btnHeight, playing ? sound::stop : sound::play));
 				rowY += btnHeight + 4;
@@ -8118,8 +8641,13 @@ public class MainScreen extends Screen {
 				sound.isRemoveDeadspace(), () -> { sound.setRemoveDeadspace(!sound.isRemoveDeadspace()); ConfigManager.save(); },
 				"Trims silence from the start of your imported sound file so it plays immediately instead of after a delay.");
 		}
+		// Per user request ("Make the volume sliders extend to 5 instead of 2... It should default to 1
+		// always but extend it so it can go up to 5, giving a 500% volume boost from base volume"): the
+		// slider's own 0-1 fraction now maps across the full 0-5 range instead of 0-2 — CustomSoundOption's
+		// own default (1f) and its setVolume clamp are unaffected, so nothing changes for a player who never
+		// touches this slider.
 		rowY = drawSliderRow(graphics, rowX, rowY, rowWidth, "Volume", String.format(Locale.ROOT, "%.2f", sound.getVolume()),
-			sound.getVolume() / 2f, v -> { sound.setVolume(v * 2f); ConfigManager.save(); }, accent);
+			sound.getVolume() / 5f, v -> { sound.setVolume(v * 5f); ConfigManager.save(); }, accent);
 		rowY = drawSliderRow(graphics, rowX, rowY, rowWidth, "Pitch", String.format(Locale.ROOT, "%.2f", sound.getPitch()),
 			sound.getPitch() / 2f, v -> { sound.setPitch(v * 2f); ConfigManager.save(); }, accent);
 		return rowY;
@@ -8149,9 +8677,9 @@ public class MainScreen extends Screen {
 		String hex = focused ? hexFieldBuffer : String.format(Locale.ROOT, "%06X", currentColor & 0xFFFFFF);
 		fillRounded(graphics, x, y, x + width, y + HEX_FIELD_HEIGHT, BOX_RADIUS, focused ? Theme.chrome(0xFF3A3A3A) : Theme.chrome(0xFF262626));
 		String display = "#" + hex;
-		graphics.text(this.font, display, x + 6, y + 4, Theme.text(0xFFDDDDDD));
+		this.text(graphics, display, x + 6, y + 4, Theme.text(0xFFDDDDDD));
 		if (focused && isCaretBlinkOn()) {
-			int caretX = x + 6 + this.font.width(display) + 1;
+			int caretX = x + 6 + this.textWidth(display) + 1;
 			graphics.fill(caretX, y + 3, caretX + 1, y + HEX_FIELD_HEIGHT - 3, 0xFFFFFFFF);
 		}
 		// Color preview: a quick visual check that the hex value looks right, without hunting for the
@@ -8168,7 +8696,7 @@ public class MainScreen extends Screen {
 
 	/** Same field, but with a label drawn above it instead of consuming vertical space via drawSliderRow's layout. */
 	private int drawLabeledHexPicker(GuiGraphicsExtractor graphics, int x, int y, int width, String label, String key, int currentColor, Consumer<Integer> setColor) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 		return drawHexPicker(graphics, x, y + 11, width, key, currentColor, setColor);
 	}
 
@@ -8176,10 +8704,10 @@ public class MainScreen extends Screen {
 		fillRounded(graphics, x, y, x + width, y + height, BOX_RADIUS, focused ? Theme.chrome(0xFF3A3A3A) : Theme.chrome(0xFF262626));
 		graphics.enableScissor(x, y, x + width, y + height);
 		if (focused) drawSelectionHighlight(graphics, text, x + 4, y + 2, height - 4);
-		graphics.text(this.font, text, x + 4, y + (height - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, text, x + 4, y + (height - 8) / 2, Theme.text(0xFFDDDDDD));
 		if (focused && isCaretBlinkOn()) {
 			int idx = Math.max(0, Math.min(textCursor, text.length()));
-			int caretX = x + 4 + this.font.width(text.substring(0, idx)) + 1;
+			int caretX = x + 4 + this.textWidth(text.substring(0, idx)) + 1;
 			graphics.fill(caretX, y + 2, caretX + 1, y + height - 2, 0xFFFFFFFF);
 		}
 		graphics.disableScissor();
@@ -8192,16 +8720,22 @@ public class MainScreen extends Screen {
 		if (!hasSelection()) return;
 		int start = Math.max(0, Math.min(Math.min(textCursor, textSelectionAnchor), text.length()));
 		int end = Math.max(0, Math.min(Math.max(textCursor, textSelectionAnchor), text.length()));
-		int x0 = textX + this.font.width(text.substring(0, start));
-		int x1 = textX + this.font.width(text.substring(0, end));
+		int x0 = textX + this.textWidth(text.substring(0, start));
+		int x1 = textX + this.textWidth(text.substring(0, end));
 		graphics.fill(x0, y, x1, y + height, 0x668899FF);
 	}
 
 	private void drawAnimationsContent(GuiGraphicsExtractor graphics, GuiAnimationsFeature gaf, int x, int y, int width, int height, int accent) {
-		String[] labels = {"Opening", "Closing", "Module opening", "Search bar", "Category switch", "Background blur"};
+		// Per user report ("Remove the category switch slider from the mod animations module. It doesnt
+		// actually do anything anymore"): confirmed — triggerContentSwap() now always applies a category/
+		// subcategory change instantly (see its own doc comment: an earlier user request replaced the
+		// crossfade with an instant switch), so contentSwapFadeAnim's duration is never actually driven by a
+		// visible transition anymore. Removed here along with GuiAnimationsFeature's own now-dead
+		// contentSwitchDuration field.
+		String[] labels = {"Opening", "Closing", "Module opening", "Search bar", "Background blur"};
 		float[] values = {gaf.getOpenDuration(), gaf.getCloseDuration(), gaf.getExpandDuration(), gaf.getSearchDuration(),
-			gaf.getContentSwitchDuration(), gaf.getBlurAmount() / 10f};
-		// The first five are raw seconds (0..MAX_DURATION), not an already-normalized 0..1 fraction — feeding
+			gaf.getBlurAmount() / 10f};
+		// The first four are raw seconds (0..MAX_DURATION), not an already-normalized 0..1 fraction — feeding
 		// them straight into drawHorizontalSlider as value01 made the fill/knob only ever reach MAX_DURATION
 		// (0.5) of the track's width, capping visually at 50% and growing the cursor/knob gap the further you
 		// dragged (read as "stops at 0.5 seconds" and "gets slower the more you drag"). Blur is already 0..1
@@ -8212,18 +8746,17 @@ public class MainScreen extends Screen {
 			values[1] / GuiAnimationsFeature.MAX_DURATION,
 			values[2] / GuiAnimationsFeature.MAX_DURATION,
 			values[3] / GuiAnimationsFeature.MAX_DURATION,
-			values[4] / GuiAnimationsFeature.MAX_DURATION,
-			values[5]
+			values[4]
 		};
 
 		int rowY = y + 8;
 		int sliderWidth = width - 110;
 		int sliderHeight = 6;
 		for (int i = 0; i < labels.length; i++) {
-			boolean isBlur = i == 5;
-			graphics.text(this.font, labels[i], x + 10, rowY, Theme.text(0xFFAAAAAA));
+			boolean isBlur = i == 4;
+			this.text(graphics, labels[i], x + 10, rowY, Theme.text(0xFFAAAAAA));
 			String valueText = isBlur ? gaf.getBlurAmount() + "/10" : String.format(Locale.ROOT, "%.2f seconds", values[i]);
-			graphics.text(this.font, valueText, x + width - 96, rowY, Theme.text(0xFF888888));
+			this.text(graphics, valueText, x + width - 96, rowY, Theme.text(0xFF888888));
 
 			int sliderX = x + 10;
 			int sliderY = rowY + 12;
@@ -8240,8 +8773,11 @@ public class MainScreen extends Screen {
 			gaf.isCogSpinEnabled(), () -> { gaf.setCogSpinEnabled(!gaf.isCogSpinEnabled()); ConfigManager.save(); });
 		rowY = drawToggleRow(graphics, x + 10, rowY, width - 20, "Slider animation",
 			gaf.isSliderAnimationEnabled(), () -> { gaf.setSliderAnimationEnabled(!gaf.isSliderAnimationEnabled()); ConfigManager.save(); });
-		drawToggleRow(graphics, x + 10, rowY, width - 20, "Smooth scrolling",
+		rowY = drawToggleRow(graphics, x + 10, rowY, width - 20, "Smooth scrolling",
 			gaf.isScrollAnimationEnabled(), () -> { gaf.setScrollAnimationEnabled(!gaf.isScrollAnimationEnabled()); ConfigManager.save(); });
+		drawToggleRow(graphics, x + 10, rowY, width - 20, "Background bubbles",
+			gaf.isBackgroundBubbles(), () -> { gaf.setBackgroundBubbles(!gaf.isBackgroundBubbles()); ConfigManager.save(); },
+			"Soft accent-colored bubbles drifting behind the mod menu, Player Viewer and Party Finder.");
 	}
 
 	private static void applyAnimSetting(GuiAnimationsFeature gaf, int index, float value01) {
@@ -8250,8 +8786,7 @@ public class MainScreen extends Screen {
 			case 1 -> gaf.setCloseDuration(value01 * GuiAnimationsFeature.MAX_DURATION);
 			case 2 -> gaf.setExpandDuration(value01 * GuiAnimationsFeature.MAX_DURATION);
 			case 3 -> gaf.setSearchDuration(value01 * GuiAnimationsFeature.MAX_DURATION);
-			case 4 -> gaf.setContentSwitchDuration(value01 * GuiAnimationsFeature.MAX_DURATION);
-			case 5 -> gaf.setBlurAmount(Math.round(value01 * 10f));
+			case 4 -> gaf.setBlurAmount(Math.round(value01 * 10f));
 			default -> {}
 		}
 		ConfigManager.save();
@@ -8292,7 +8827,7 @@ public class MainScreen extends Screen {
 	/** Small caption drawn above a color picker so it's clear what the color actually controls — every
 	 *  drawFullColorPicker call site should have one of these (or an equivalent label) right before it. */
 	private void colorPickerLabel(GuiGraphicsExtractor graphics, int x, int y, String label) {
-		graphics.text(this.font, label, x, y, Theme.text(0xFFAAAAAA));
+		this.text(graphics, label, x, y, Theme.text(0xFFAAAAAA));
 	}
 
 	private int drawFullColorPicker(GuiGraphicsExtractor graphics, int squareX, int squareY, int width, String key,
@@ -8318,7 +8853,7 @@ public class MainScreen extends Screen {
 		int sliderGap = compact ? 15 : 22;
 		for (int i = 0; i < labels.length; i++) {
 			int sliderX = sliderAreaX + i * sliderGap;
-			graphics.text(this.font, labels[i], sliderX + (sliderWidth - this.font.width(labels[i])) / 2, squareY - 10, Theme.text(0xFFAAAAAA));
+			this.text(graphics, labels[i], sliderX + (sliderWidth - this.textWidth(labels[i])) / 2, squareY - 10, Theme.text(0xFFAAAAAA));
 			float value01 = channelValues[i] / 255f;
 			String sliderKey = key + "_" + labels[i];
 			drawVerticalSlider(graphics, sliderKey, sliderX, squareY, sliderWidth, sliderTrackHeight, value01, accent);
@@ -8331,11 +8866,11 @@ public class MainScreen extends Screen {
 
 		String resetLabel = "Reset";
 		int resetHeight = 14;
-		int resetWidth = this.font.width(resetLabel) + 8;
+		int resetWidth = this.textWidth(resetLabel) + 8;
 		int resetX = sliderAreaX + labels.length * sliderGap + 6;
 		int resetY = squareY + sliderTrackHeight / 2 - resetHeight / 2;
 		fillRounded(graphics, resetX, resetY, resetX + resetWidth, resetY + resetHeight, SMALL_RADIUS, Theme.chrome(0xFF2A2A2A));
-		graphics.text(this.font, resetLabel, resetX + (resetWidth - this.font.width(resetLabel)) / 2, resetY + (resetHeight - 8) / 2, Theme.text(0xFFDDDDDD));
+		this.text(graphics, resetLabel, resetX + (resetWidth - this.textWidth(resetLabel)) / 2, resetY + (resetHeight - 8) / 2, Theme.text(0xFFDDDDDD));
 		clickHits.add(new ClickHit(resetX, resetY, resetWidth, resetHeight, () -> { setColor.accept(defaultColor); ConfigManager.save(); }));
 
 		int hexY = drawHexPicker(graphics, squareX, squareY + squareSize + 12, width, key + "_hex", color, setColor);
@@ -8484,14 +9019,14 @@ public class MainScreen extends Screen {
 
 	private void drawScaledText(GuiGraphicsExtractor graphics, String text, int x, int y, int color, float scale, float pivotX, float pivotY) {
 		if (Math.abs(scale - 1f) < 0.002f) {
-			graphics.text(this.font, text, x, y, color);
+			this.text(graphics, text, x, y, color);
 			return;
 		}
 		graphics.pose().pushMatrix();
 		graphics.pose().translate(pivotX, pivotY);
 		graphics.pose().scale(scale);
 		graphics.pose().translate(-pivotX, -pivotY);
-		graphics.text(this.font, text, x, y, color);
+		this.text(graphics, text, x, y, color);
 		graphics.pose().popMatrix();
 	}
 
@@ -8921,12 +9456,19 @@ public class MainScreen extends Screen {
 			}
 			if (mx >= copilotExportButtonX && mx <= copilotExportButtonX + copilotExportButtonWidth
 					&& my >= copilotExportButtonY && my <= copilotExportButtonY + copilotExportButtonHeight && inListViewport(copilotExportButtonY)) {
+				long now = System.nanoTime();
+				if (now < copilotExportCooldownEndNanos) return true;
 				String exported = dcfExpanded.exportToClipboardString();
 				if (exported != null) {
 					this.minecraft.keyboardHandler.setClipboard(exported);
-					if (this.minecraft.player != null) {
-						this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-							"§aBoss Guide plan copied to clipboard (" + exported.length() + " characters)."));
+					copilotExportCooldownEndNanos = now + EXPORT_COOLDOWN_NANOS;
+					// Per user request ("Change the other exports (dungeon routes, boss guide) to use the same
+					// notification and cooldown system"): same shared toast the config export uses, gated on
+					// the same Mod Notifications Export Successful subtoggle.
+					if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+							|| mnf.isExportSuccessEnabled()) {
+						com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Export successful",
+							"Boss Guide plan copied to clipboard\n" + exported.length() + " characters");
 					}
 				}
 				return true;
@@ -8967,12 +9509,16 @@ public class MainScreen extends Screen {
 				}
 				if (mx >= routeAllExportButtonX && mx <= routeAllExportButtonX + routeAllExportButtonWidth
 						&& my >= routeAllExportButtonY && my <= routeAllExportButtonY + routeAllExportButtonHeight && inListViewport(routeAllExportButtonY)) {
+					long now = System.nanoTime();
+					if (now < routeAllExportCooldownEndNanos) return true;
 					String exported = drfExpanded.exportAllToClipboardString();
 					if (exported != null) {
 						this.minecraft.keyboardHandler.setClipboard(exported);
-						if (this.minecraft.player != null) {
-							this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-								"§aDungeon Routes (all rooms) copied to clipboard (" + exported.length() + " characters)."));
+						routeAllExportCooldownEndNanos = now + EXPORT_COOLDOWN_NANOS;
+						if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+								|| mnf.isExportSuccessEnabled()) {
+							com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Export successful",
+								"Dungeon Routes (all rooms) copied to clipboard\n" + exported.length() + " characters");
 						}
 					}
 					return true;
@@ -9004,12 +9550,16 @@ public class MainScreen extends Screen {
 				}
 				if (mx >= routeRoomExportButtonX && mx <= routeRoomExportButtonX + routeRoomExportButtonWidth
 						&& my >= routeRoomExportButtonY && my <= routeRoomExportButtonY + routeRoomExportButtonHeight && inListViewport(routeRoomExportButtonY)) {
+					long now = System.nanoTime();
+					if (now < routeRoomExportCooldownEndNanos) return true;
 					String exported = drfExpanded.exportRoomToClipboardString(selectedRouteRoomName);
 					if (exported != null) {
 						this.minecraft.keyboardHandler.setClipboard(exported);
-						if (this.minecraft.player != null) {
-							this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-								"§aDungeon Routes (" + selectedRouteRoomName + ") copied to clipboard (" + exported.length() + " characters)."));
+						routeRoomExportCooldownEndNanos = now + EXPORT_COOLDOWN_NANOS;
+						if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+								|| mnf.isExportSuccessEnabled()) {
+							com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Export successful",
+								"Dungeon Routes (" + selectedRouteRoomName + ") copied to clipboard\n" + exported.length() + " characters");
 						}
 					}
 					return true;
@@ -9138,14 +9688,29 @@ public class MainScreen extends Screen {
 				}
 				return true;
 			}
+			if (mx >= configFileButtonX && mx <= configFileButtonX + configFileButtonWidth
+					&& my >= configFileButtonY && my <= configFileButtonY + configFileButtonHeight) {
+				attemptConfigFileImport();
+				return true;
+			}
 			if (mx >= configExportButtonX && mx <= configExportButtonX + configExportButtonWidth
 					&& my >= configExportButtonY && my <= configExportButtonY + configExportButtonHeight) {
+				long now = System.nanoTime();
+				// Per user request ("You can spam the config export, add a live cooldown of 10 seconds on
+				// successful export"): ignore the click entirely while still cooling down from the last one.
+				if (now < configExportCooldownEndNanos) return true;
 				String exported = ConfigManager.exportToClipboardString();
 				if (exported != null) {
 					this.minecraft.keyboardHandler.setClipboard(exported);
-					if (this.minecraft.player != null) {
-						this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-							"§aConfig copied to clipboard (" + exported.length() + " characters)."));
+					configExportCooldownEndNanos = now + EXPORT_COOLDOWN_NANOS;
+					// Per user request ("Export successful notification... basically turn the 'Config copied
+					// to clipboard (45389 characters).' into a notification instead of a chat message"): routed
+					// through the same shared toast Update Ready uses, gated on Mod Notifications' own
+					// Export Successful subtoggle instead of always firing.
+					if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+							|| mnf.isExportSuccessEnabled()) {
+						com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Export successful",
+							"Config copied to clipboard\n" + exported.length() + " characters");
 					}
 				} else if (this.minecraft.player != null) {
 					this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal("§cExport failed."));
@@ -9259,12 +9824,16 @@ public class MainScreen extends Screen {
 			}
 			if (mx >= posMsgConfigExportButtonX && mx <= posMsgConfigExportButtonX + posMsgConfigExportButtonWidth
 					&& my >= posMsgConfigExportButtonY && my <= posMsgConfigExportButtonY + posMsgConfigExportButtonHeight && inListViewport(posMsgConfigExportButtonY)) {
+				long now = System.nanoTime();
+				if (now < posMsgExportCooldownEndNanos) return true;
 				String exported = pmf.exportToClipboardString();
 				if (exported != null) {
 					this.minecraft.keyboardHandler.setClipboard(exported);
-					if (this.minecraft.player != null) {
-						this.minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-							"§aPositional Messages config copied to clipboard (" + exported.length() + " characters)."));
+					posMsgExportCooldownEndNanos = now + EXPORT_COOLDOWN_NANOS;
+					if (!(FeatureRegistry.get("mod_notifications") instanceof com.cokelord.skyblocksimplified.feature.impl.ModNotificationsFeature mnf)
+							|| mnf.isExportSuccessEnabled()) {
+						com.cokelord.skyblocksimplified.gui.NotificationToastRenderer.show("Export successful",
+							"Positional Messages config copied to clipboard\n" + exported.length() + " characters");
 					}
 				}
 				return true;
@@ -9280,7 +9849,7 @@ public class MainScreen extends Screen {
 						textFocus = focus;
 						editingPosMsgIndex = msgIndex;
 						String fieldText = getFocusedText();
-						int textX = b[0] + 4 + (focus == TextFocus.POSMSG_TEXT ? 0 : this.font.width(switch (focus) {
+						int textX = b[0] + 4 + (focus == TextFocus.POSMSG_TEXT ? 0 : this.textWidth(switch (focus) {
 							case POSMSG_X -> "X:"; case POSMSG_Y -> "Y:"; case POSMSG_Z -> "Z:"; case POSMSG_RANGE -> "R:"; default -> "";
 						}));
 						if (doubleClick && alreadyFocused) {
@@ -9383,8 +9952,13 @@ public class MainScreen extends Screen {
 		}
 
 		for (FeatureRow row : featureRows) {
-			boolean opensSettings = (row.cogClickable && row.cogContains(mx, my))
-				|| (row.isColorSwatch && row.toggleContains(mx, my));
+			// A row is kept in featureRows while ANY part of it is on screen, so a half-scrolled-out row's
+			// toggle/cog can sit outside the list viewport (under the header or past the bottom edge) —
+			// same stale-off-viewport-hit class inListViewport() exists for. Only a fully visible control
+			// counts, so a click there can never silently flip a module the player can't see.
+			boolean controlsVisible = inListViewport(row.toggleY) && inListViewport(row.toggleY + row.toggleHeight);
+			boolean opensSettings = (row.cogClickable && row.cogContains(mx, my) && inListViewport(row.cogY) && inListViewport(row.cogY + row.cogSize))
+				|| (row.isColorSwatch && controlsVisible && row.toggleContains(mx, my));
 			if (opensSettings) {
 				// Per user request: opening a result's settings (cog, or the row itself below) is drilling
 				// into that same search result, not navigating away from it — the query should stay put so
@@ -9399,7 +9973,7 @@ public class MainScreen extends Screen {
 				}
 				return true;
 			}
-			if (row.toggleable && row.toggleContains(mx, my)) {
+			if (row.toggleable && controlsVisible && row.toggleContains(mx, my)) {
 				// Per user request: toggling a feature is acting on a search result, not navigating away
 				// from it — same "drilling in, not leaving" reasoning as the cog/row-click branches below,
 				// which already leave the query in place. Previously closed search here too (see this

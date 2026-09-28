@@ -15,9 +15,9 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 public final class TpsMonitor {
 	private TpsMonitor() {}
 
-	private static long lastPacketAtMs = -1;
-	private static long lastGameTime = -1;
-	private static double estimatedTps = 20.0;
+	private static volatile long lastPacketAtMs = -1;
+	private static volatile long lastGameTime = -1;
+	private static volatile double estimatedTps = 20.0;
 	private static boolean registered = false;
 
 	public static synchronized void register() {
@@ -28,6 +28,9 @@ public final class TpsMonitor {
 
 	public static void onSetTime(long gameTime) {
 		long now = System.currentTimeMillis();
+		// The handler runs twice per packet (network thread, then main thread); keep the first, earlier
+		// arrival time — the main-thread repeat would shift the anchor late by up to a frame.
+		if (gameTime == lastGameTime) return;
 		if (lastPacketAtMs >= 0 && lastGameTime >= 0) {
 			long tickDelta = gameTime - lastGameTime;
 			long msDelta = now - lastPacketAtMs;
@@ -62,6 +65,16 @@ public final class TpsMonitor {
 	 *  confirmed-broken feature is worse than the lag-detection gap this was trying to close. The Blood Camp
 	 *  countdown-vs-lag report from earlier this round is still open; it needs a fix that doesn't depend on
 	 *  guessing this packet's real send interval. */
+	/** Server game time from the most recent time-sync packet (-1 before the first one). */
+	public static long lastGameTime() {
+		return lastGameTime;
+	}
+
+	/** Wall clock (ms) when the most recent time-sync packet arrived (-1 before the first one). */
+	public static long lastPacketAtMs() {
+		return lastPacketAtMs;
+	}
+
 	public static double getEstimatedTps() {
 		return estimatedTps;
 	}

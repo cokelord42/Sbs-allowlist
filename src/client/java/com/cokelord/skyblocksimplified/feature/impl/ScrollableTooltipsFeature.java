@@ -42,12 +42,12 @@ public class ScrollableTooltipsFeature extends Feature {
 	// Real px/notch feel, matching this codebase's other UI scroll speeds (see e.g. StorageOverlayFeature's
 	// own SCROLL_SPEED) rather than a raw 1:1 wheel-delta mapping, which reads as far too slow for text.
 	private static final float SCROLL_SPEED = 14f;
-	// How much of a long tooltip must stay visible at the bottom of a full scroll — keeps the last line or
-	// two on screen instead of letting the whole tooltip scroll away into empty space.
-	private static final int MIN_VISIBLE_TAIL = 40;
+	// Gap vanilla's tooltip positioner leaves from the screen edge.
+	private static final int SCREEN_EDGE_MARGIN = 4;
 
 	private static float scrollOffset = 0f;
 	private static float lastMaxScroll = 0f;
+	private static float lastMinScroll = 0f;
 	private static boolean shownThisTick = false;
 	private static boolean shownLastTick = false;
 
@@ -74,19 +74,41 @@ public class ScrollableTooltipsFeature extends Feature {
 		if (!shownThisTick) {
 			scrollOffset = 0f;
 			lastMaxScroll = 0f;
+			lastMinScroll = 0f;
 		}
 		shownLastTick = shownThisTick;
 		shownThisTick = false;
 	}
 
 	/** Called from {@code TooltipScrollMixin}'s HEAD injection, once per real tooltip draw. */
-	public static void beginTooltip(GuiGraphicsExtractor graphics, Font font, List<ClientTooltipComponent> components) {
+	public static void beginTooltip(GuiGraphicsExtractor graphics, Font font, List<ClientTooltipComponent> components,
+									int mouseX, int mouseY, net.minecraft.client.gui.screens.inventory.tooltip.ClientTooltipPositioner positioner) {
 		shownThisTick = true;
 		if (instance == null || !instance.isEnabled()) return;
-		int totalHeight = 0;
-		for (ClientTooltipComponent c : components) totalHeight += c.getHeight(font) + 2;
-		lastMaxScroll = Math.max(0, totalHeight - MIN_VISIBLE_TAIL);
-		scrollOffset = Math.max(0f, Math.min(lastMaxScroll, scrollOffset));
+		// Per user request: only scroll a tooltip that actually runs off the screen, and only until the cut-off
+		// part is fully visible. A tooltip that fits is never scrolled, so the wheel stays free for whatever
+		// screen is underneath. Uses the SAME positioner vanilla is about to use, so we know whether the top or
+		// the bottom is the part off-screen (a tall tooltip usually gets pushed up, cutting off its TOP — the
+		// old bottom-only range couldn't reveal that). Width/height mirror vanilla's own tooltip() layout.
+		int totalHeight = 0, width = 0;
+		for (ClientTooltipComponent c : components) {
+			totalHeight += c.getHeight(font);
+			width = Math.max(width, c.getWidth(font));
+		}
+		if (components.size() > 1) totalHeight += 2;
+		int top, bottom;
+		if (positioner != null) {
+			var pos = positioner.positionTooltip(graphics.guiWidth(), graphics.guiHeight(), mouseX, mouseY, width, totalHeight);
+			top = pos.y() - 4;
+			bottom = pos.y() + totalHeight + 4;
+		} else {
+			top = 0;
+			bottom = totalHeight + 8;
+		}
+		// offset > 0 moves the tooltip up (reveals the bottom), offset < 0 moves it down (reveals the top).
+		lastMinScroll = Math.min(0, top - SCREEN_EDGE_MARGIN);
+		lastMaxScroll = Math.max(0, bottom - (graphics.guiHeight() - SCREEN_EDGE_MARGIN));
+		scrollOffset = Math.max(lastMinScroll, Math.min(lastMaxScroll, scrollOffset));
 		graphics.pose().pushMatrix();
 		graphics.pose().translate(0, -scrollOffset);
 	}
@@ -101,8 +123,8 @@ public class ScrollableTooltipsFeature extends Feature {
 	}
 
 	private static boolean handleScroll(double verticalAmount) {
-		if (instance == null || !instance.isEnabled() || !shownLastTick || lastMaxScroll <= 0f) return false;
-		scrollOffset = Math.max(0f, Math.min(lastMaxScroll, scrollOffset - (float) verticalAmount * SCROLL_SPEED));
+		if (instance == null || !instance.isEnabled() || !shownLastTick || (lastMaxScroll <= 0f && lastMinScroll >= 0f)) return false;
+		scrollOffset = Math.max(lastMinScroll, Math.min(lastMaxScroll, scrollOffset - (float) verticalAmount * SCROLL_SPEED));
 		return true;
 	}
 

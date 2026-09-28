@@ -13,6 +13,8 @@ import com.google.gson.JsonObject;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
 import net.minecraft.network.chat.TextColor;
@@ -51,7 +53,7 @@ import java.util.regex.Pattern;
  * zone simply doesn't run once its one relevant section has passed. Core is different: per user spec
  * (originally "reprihand the alert until section 3 is active", corrected the round after to "the core early
  * enter should be active from section 2 and on" once the withhold-until-S3 gate silently ate a real S2 entry),
- * a Mage reaching Core before section 2 starts is still detected and remembered, just not ALERTED until
+ * a player reaching Core before section 2 starts is still detected and remembered, just not ALERTED until
  * section 2 actually starts — see {@link #onZoneEntered} and the section-2-transition drain in {@link #onTick}.
  *
  * <p>Every alert is edge-triggered (fires once on the tick a teammate transitions from outside to inside a
@@ -63,10 +65,15 @@ public class EarlyEnterDetectionFeature extends Feature {
 	private enum Zone {
 		EE2(70, 107, 121, 55, 138, 141, DungeonState.TerminalSection.S1, null, "EE2", 0xFF55FFFF),
 		EE3(17, 107, 108, -3, 134, 87, DungeonState.TerminalSection.S2, null, "EE3", 0xFFFFAA00),
-		// Per user spec ("for mage going to core"): the only zone restricted to a specific class. Its
-		// activeSection is S2 (not S3) per the "active from section 2 and on" correction — see the class doc
-		// comment and onZoneEntered/onTick, which no longer withhold Core's alert once section 2 has started.
-		CORE(57, 114, 53, 50, 117, 47, DungeonState.TerminalSection.S2, DungeonClass.MAGE, "Core", 0xFFAA00AA);
+		// Real bug found (per user report — "The early enter detection for core should support all classes,
+		// not just mage. Some people play like mage roles where they do mage stuff with different classes
+		// for optimal class xp gain, and the stuff wont work then"): originally restricted to DungeonClass.
+		// MAGE specifically (per the ORIGINAL user spec, "for mage going to core"), but a real player can run
+		// the same early-Core strategy on any class for their own XP-farming reasons — no class restriction
+		// left, same as EE2/EE3 above. Its activeSection is S2 (not S3) per the "active from section 2 and on"
+		// correction — see the class doc comment and onZoneEntered/onTick, which no longer withhold Core's
+		// alert once section 2 has started.
+		CORE(57, 114, 53, 50, 117, 47, DungeonState.TerminalSection.S2, null, "Core", 0xFFAA00AA);
 
 		final AABB box;
 		final DungeonState.TerminalSection activeSection;
@@ -93,13 +100,20 @@ public class EarlyEnterDetectionFeature extends Feature {
 	// working"): a plain testing aid.
 	private boolean renderBoxes = false;
 	private float boxOpacityPercent = 40f;
-	// Per user request ("make a toggle for rendering all boxes even if its not s1, s2, s3"): on by default
-	// (draws all three regardless of the live terminal section, the original behavior) so a tester can see
-	// every box's placement at once without needing to be in the exact right section for each one; turning
-	// it off instead only draws whichever single zone is actually relevant to the CURRENT live section
-	// (EE2 during S1, EE3/Core during S2 and on — same mapping detection itself uses), matching what
-	// would realistically be shown during real play.
-	private boolean renderAllBoxesRegardlessOfSection = true;
+	// Per user request ("make a toggle for rendering all boxes even if its not s1, s2, s3"): draws all three
+	// regardless of the live terminal section when on; turning it off instead only draws whichever single
+	// zone is actually relevant to the CURRENT live section (EE2 during S1, EE3/Core during S2 and on — same
+	// mapping detection itself uses), matching what would realistically be shown during real play.
+	//
+	// Real bug found (per user report — "when i enable 'render boxes' they render unconditionally in other
+	// worlds aswell. They should only render when its the section before the box"): this used to default to
+	// true so a tester could see every box's placement at once — but combined with renderBoxesStatic's own
+	// missing dungeon gate (see that method's own doc comment), this meant the boxes rendered at their fixed
+	// F7 world coordinates in literally ANY world, section-relevance ignored, the moment the toggle was
+	// flipped on — meaningless (and visually confusing) anywhere that isn't actually the F7 terminal room.
+	// Defaulted to false now: real section-relevance is the sane default, with "show everything at once"
+	// still available as an explicit opt-in for testing.
+	private boolean renderAllBoxesRegardlessOfSection = false;
 
 	private int soundRepeatCount = 3;
 	private final CustomSoundOption sound = new CustomSoundOption(TerminalSoundsFeature.SOUND_IDS, TerminalSoundsFeature.SOUND_LABELS);
@@ -114,6 +128,16 @@ public class EarlyEnterDetectionFeature extends Feature {
 	private float screenColorOpacityPercent = 40f;
 	private long screenColorUntilMillis = 0L;
 	private static final long SCREEN_COLOR_DURATION_MILLIS = 5_000L;
+	// Per user request ("Add a new option in the early enter detection module that coordinates the leap menu
+	// and the early enter detection, where when it detect someone early entering, going into the leap menu
+	// hides the ones that are not leaping and shows only the early enter person in the center. This should
+	// automatically turn itself off after 5 seconds, just like the red screen tinting"): same duration/self-
+	// clearing shape as screenColorUntilMillis above, checked live from LeapMenuFeature (see
+	// getActiveLeapMenuHighlightUsername) rather than pushed to it — so it "turns off" for free the instant
+	// the 5 seconds pass, with no separate timer/callback needed on the Leap Menu side at all.
+	private boolean coordinateWithLeapMenu = false;
+	private String highlightedEarlyEnterUsername = null;
+	private long highlightedEarlyEnterUntilMillis = 0L;
 	// Real, confirmed Hypixel line sent to the LOCAL player the instant any real Spirit Leap teleport lands
 	// (same regex DungeonsCopilotFeature's own LEAP_COMPLETED_PATTERN already confirmed) — this line is only
 	// ever sent to the player who leaped, so no local-player-name check is needed.
@@ -137,6 +161,24 @@ public class EarlyEnterDetectionFeature extends Feature {
 	private static boolean listenersRegistered = false;
 	private static EarlyEnterDetectionFeature instance;
 
+	/** Whether a player is inside the EE2 (section 2) early-enter box — the Levers device sits inside it, so
+	 *  a device completed during S1 while someone is in there is the S2 Levers device (Dungeons Copilot).
+	 *  With {@code playerName} set, checks that player (the completer named in chat); if they aren't loaded,
+	 *  or with null, checks every loaded player. Works whether or not this feature is enabled. */
+	public static boolean isInSection2Box(String playerName) {
+		net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+		if (mc.level == null) return false;
+		if (playerName != null) {
+			for (net.minecraft.world.entity.player.Player p : mc.level.players()) {
+				if (p.getName().getString().equals(playerName)) return Zone.EE2.box.contains(p.position());
+			}
+		}
+		for (net.minecraft.world.entity.player.Player p : mc.level.players()) {
+			if (Zone.EE2.box.contains(p.position())) return true;
+		}
+		return false;
+	}
+
 	public EarlyEnterDetectionFeature() {
 		super("early_enter_detection", "Early Enter Detection", FeatureCategory.COMBAT, false);
 		instance = this;
@@ -157,16 +199,44 @@ public class EarlyEnterDetectionFeature extends Feature {
 			});
 			// addLast (not attachElementBefore) — per user request ("big overlay above everything"), this
 			// needs to draw on top of every other HUD element, not tucked behind one specific anchor.
+			//
+			// Per a later user request ("make sure its below z level of the leap menu and the black
+			// background, but above all else"): skipped here specifically while the Leap Menu's own replaced
+			// screen is open, since LeapMenuFeature.renderReplacement now calls renderScreenColorOverlayIfActive
+			// itself, sandwiched between its own background fill and its quadrant boxes — drawing it here too
+			// in that case would double-render it (and, since HUD renders before the Screen either way, this
+			// copy would just sit UNDER the leap menu's own copy, adding nothing but a second alpha layer).
 			HudElementRegistry.addLast(SCREEN_COLOR_HUD_ID, (graphics, deltaTracker) -> {
-				if (instance == null || !instance.isEnabled() || !instance.screenColorEnabled) return;
-				if (System.currentTimeMillis() >= instance.screenColorUntilMillis) return;
-				Minecraft mc = Minecraft.getInstance();
-				int width = mc.getWindow().getGuiScaledWidth();
-				int height = mc.getWindow().getGuiScaledHeight();
-				int alpha = Math.round(instance.screenColorOpacityPercent / 100f * 255f);
-				graphics.fill(0, 0, width, height, (alpha << 24) | (instance.screenColor & 0xFFFFFF));
+				if (Minecraft.getInstance().gui.screen() instanceof AbstractContainerScreen<?> screen
+					&& LeapMenuFeature.shouldReplaceRender(screen)) return;
+				renderScreenColorOverlayIfActive(graphics);
 			});
 		}
+	}
+
+	/** Shared by the normal HUD hook (registered in {@link #onEnable}) and
+	 *  {@link LeapMenuFeature#renderReplacement} — see that hook's own doc comment for why the Leap Menu case
+	 *  calls this directly instead of relying on the HUD hook while its own screen is open. */
+	static void renderScreenColorOverlayIfActive(GuiGraphicsExtractor graphics) {
+		if (instance == null || !instance.isEnabled() || !instance.screenColorEnabled) return;
+		if (System.currentTimeMillis() >= instance.screenColorUntilMillis) return;
+		Minecraft mc = Minecraft.getInstance();
+		int width = mc.getWindow().getGuiScaledWidth();
+		int height = mc.getWindow().getGuiScaledHeight();
+		int alpha = Math.round(instance.screenColorOpacityPercent / 100f * 255f);
+		graphics.fill(0, 0, width, height, (alpha << 24) | (instance.screenColor & 0xFFFFFF));
+	}
+
+	/** {@link LeapMenuFeature} calls this every frame it renders its quadrants — a non-null result (and only
+	 *  while it stays non-null, since the 5-second expiry is checked live here rather than pushed out via a
+	 *  callback) means "hide every other teammate and show just this one, centered." See this class's own
+	 *  {@code coordinateWithLeapMenu} field doc comment for why turning it back off needs no extra code on
+	 *  either side. */
+	public static String getActiveLeapMenuHighlightUsername() {
+		if (instance == null || !instance.isEnabled() || !instance.coordinateWithLeapMenu) return null;
+		if (instance.highlightedEarlyEnterUsername == null) return null;
+		if (System.currentTimeMillis() >= instance.highlightedEarlyEnterUntilMillis) return null;
+		return instance.highlightedEarlyEnterUsername;
 	}
 
 	// See screenColorUntilMillis's own doc comment — the leap stop condition. Never cancels the real line.
@@ -186,6 +256,8 @@ public class EarlyEnterDetectionFeature extends Feature {
 		lastSection = DungeonState.TerminalSection.NONE;
 		pendingSoundPlays = 0;
 		screenColorUntilMillis = 0L;
+		highlightedEarlyEnterUsername = null;
+		highlightedEarlyEnterUntilMillis = 0L;
 	}
 
 	@Override
@@ -206,7 +278,7 @@ public class EarlyEnterDetectionFeature extends Feature {
 		lastSection = section;
 
 		// See coreWaitingForSection2's own doc comment — the moment section 2 actually starts, release every
-		// alert that was being withheld for a Mage who reached Core early.
+		// alert that was being withheld for a player who reached Core early.
 		if (justReachedS2OrLater && !coreWaitingForSection2.isEmpty()) {
 			for (Map.Entry<String, DungeonClass> entry : coreWaitingForSection2.entrySet()) {
 				fireAlert(Zone.CORE, entry.getKey(), entry.getValue());
@@ -260,6 +332,10 @@ public class EarlyEnterDetectionFeature extends Feature {
 		sendAlert(alertText);
 		sendTitle(alertText);
 		if (screenColorEnabled) screenColorUntilMillis = System.currentTimeMillis() + SCREEN_COLOR_DURATION_MILLIS;
+		if (coordinateWithLeapMenu) {
+			highlightedEarlyEnterUsername = username;
+			highlightedEarlyEnterUntilMillis = System.currentTimeMillis() + SCREEN_COLOR_DURATION_MILLIS;
+		}
 		pendingSoundPlays = Math.max(1, soundRepeatCount);
 		sound.play();
 		pendingSoundPlays--;
@@ -308,12 +384,18 @@ public class EarlyEnterDetectionFeature extends Feature {
 
 	// Real bug found (per user report — "The early enter thing has issues. It genuinely did nothing it
 	// seems, and it renders no boxes"): this used to require isInDungeon()+isInBoss()+floor 7 before drawing
-	// anything at all — the exact same gate the REAL detection logic needs (correctly, so it can't false-
-	// positive outside a real F7 boss fight), but wrong for a TESTING aid whose entire point is letting the
-	// user verify box placement without needing to fight all the way to a live terminals phase first. Now
-	// draws unconditionally whenever the toggle is on, regardless of dungeon/section state.
+	// anything at all — correct for the REAL detection logic (so it can't false-positive outside a real F7
+	// boss fight), but wrong for a TESTING aid whose entire point is letting the user verify box placement
+	// without needing to fight all the way to a live terminals phase first. Dropped ALL of that gating at
+	// the time, which overcorrected into a second real bug (per later user report — "they render
+	// unconditionally in other worlds aswell"): these are fixed F7-world coordinates, meaningless (and
+	// visually confusing) rendered at that same position in literally any other world/island/floor. Now
+	// requires actually being in the F7 dungeon instance specifically — real coordinates in the right world
+	// — but still not isInBoss(), so a tester can preview box placement anywhere in F7 (including before
+	// the boss fight even starts) without needing to reach a live terminals phase first.
 	private static void renderBoxesStatic() {
 		if (instance == null || !instance.isEnabled() || !instance.renderBoxes) return;
+		if (!DungeonState.isInDungeon() || DungeonState.getFloorNumber() != 7) return;
 		try {
 			instance.renderBoxesInner();
 		} catch (Exception e) {
@@ -352,6 +434,8 @@ public class EarlyEnterDetectionFeature extends Feature {
 	public void setScreenColor(int value) { screenColor = value; }
 	public float getScreenColorOpacityPercent() { return screenColorOpacityPercent; }
 	public void setScreenColorOpacityPercent(float value) { screenColorOpacityPercent = Math.max(0f, Math.min(100f, value)); }
+	public boolean isCoordinateWithLeapMenu() { return coordinateWithLeapMenu; }
+	public void setCoordinateWithLeapMenu(boolean value) { coordinateWithLeapMenu = value; }
 
 	@Override
 	public JsonElement savePersistedData() {
@@ -364,6 +448,7 @@ public class EarlyEnterDetectionFeature extends Feature {
 		obj.addProperty("screenColorEnabled", screenColorEnabled);
 		obj.addProperty("screenColor", screenColor);
 		obj.addProperty("screenColorOpacityPercent", screenColorOpacityPercent);
+		obj.addProperty("coordinateWithLeapMenu", coordinateWithLeapMenu);
 		return obj;
 	}
 
@@ -378,10 +463,11 @@ public class EarlyEnterDetectionFeature extends Feature {
 		if (obj.has("screenColorEnabled")) screenColorEnabled = obj.get("screenColorEnabled").getAsBoolean();
 		if (obj.has("screenColor")) screenColor = obj.get("screenColor").getAsInt();
 		if (obj.has("screenColorOpacityPercent")) screenColorOpacityPercent = obj.get("screenColorOpacityPercent").getAsFloat();
+		if (obj.has("coordinateWithLeapMenu")) coordinateWithLeapMenu = obj.get("coordinateWithLeapMenu").getAsBoolean();
 	}
 
 	@Override
 	public String getDescription() {
-		return "Alerts you in chat (with a repeating sound) when a party member reaches the next terminal section's early-enter spot, or a Mage reaches Core.";
+		return "Alerts you in chat (with a repeating sound) when a party member reaches the next terminal section's early-enter spot, or reaches Core early.";
 	}
 }

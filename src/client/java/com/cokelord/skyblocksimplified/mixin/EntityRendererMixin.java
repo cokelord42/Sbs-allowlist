@@ -36,8 +36,6 @@ public class EntityRendererMixin {
 		// should ever be able to match the local player, regardless of which one fired — enforced once
 		// here instead of trusting every current and future rule's predicate to remember it.
 		boolean isSelf = entity == net.minecraft.client.Minecraft.getInstance().player;
-		String matchedRuleId = isSelf ? null : MobHighlightRegistry.getMatchedRuleId(entity);
-		int highlightColor = matchedRuleId != null ? MobHighlightRegistry.getColorFor(entity) : 0;
 		// Real bug found (per user report — "The glow is STILL rendering on starred mobs"): the real render
 		// pass this feeds (EntityRenderState.appearsGlowing()) checks state.outlineColor != 0 directly, NOT
 		// entity.isCurrentlyGlowing() again — so EntityGlowingMixin's own Hide Glow suppression (below, which
@@ -47,10 +45,13 @@ public class EntityRendererMixin {
 		// suppress kept showing its outline anyway, sourced from here instead of real vanilla glow. Same
 		// suppression check as EntityGlowingMixin now applies here too, before outlineColor is ever set.
 		boolean hideGlow = !isSelf && com.cokelord.skyblocksimplified.feature.impl.PlayerGlowFeature.shouldHideGlow(entity);
-		if (!hideGlow && highlightColor != 0 && com.cokelord.skyblocksimplified.highlight.HighlightRenderModeUtil.wants3dOutline(entity)) {
-			state.outlineColor = highlightColor;
-		} else if (hideGlow) {
+		// wants3dOutline() is checked before the rule lookup so the (per-entity, per-frame) rule scan is
+		// skipped entirely while every highlight renders as a 2D box.
+		if (hideGlow) {
 			state.outlineColor = 0;
+		} else if (!isSelf && com.cokelord.skyblocksimplified.highlight.HighlightRenderModeUtil.wants3dOutline(entity)) {
+			int highlightColor = MobHighlightRegistry.getColorFor(entity);
+			if (highlightColor != 0) state.outlineColor = highlightColor;
 		}
 
 		int alpha = EntityTransparencyRegistry.getAlphaFor(entity);
@@ -83,7 +84,6 @@ class EntityGlowingMixin {
 		// per explicit user request ("hide player glow should hide your own glow as well"), it applies to
 		// self too.
 		if (!isSelf) {
-			String matchedRuleId = MobHighlightRegistry.getMatchedRuleId(self);
 			// Per user request: a dedicated module to hide the real (vanilla/Hypixel-driven) glow on other
 			// players/entities. Real bug found (per user report — "Glow seems to apply on a LOT of dungeon
 			// mobs now for some reason. Stop the client from ever rendering glow if that module is
@@ -102,9 +102,9 @@ class EntityGlowingMixin {
 				cir.setReturnValue(false);
 				return;
 			}
-			int color = matchedRuleId != null ? MobHighlightRegistry.getColorFor(self) : 0;
-			if (!cir.getReturnValueZ() && color != 0
-				&& com.cokelord.skyblocksimplified.highlight.HighlightRenderModeUtil.wants3dOutline(self)) {
+			if (!cir.getReturnValueZ()
+				&& com.cokelord.skyblocksimplified.highlight.HighlightRenderModeUtil.wants3dOutline(self)
+				&& MobHighlightRegistry.getColorFor(self) != 0) {
 				cir.setReturnValue(true);
 			}
 			return;

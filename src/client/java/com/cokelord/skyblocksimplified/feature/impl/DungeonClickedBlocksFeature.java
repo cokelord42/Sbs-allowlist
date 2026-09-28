@@ -106,7 +106,7 @@ public class DungeonClickedBlocksFeature extends Feature {
 					return;
 				}
 				instance.playChime();
-				if (!instance.isEnabled()) return;
+				if (!instance.isEnabled() || pos == null) return;
 				instance.show(pos, instance.colorFor(type));
 			});
 			ClientReceiveMessageEvents.GAME.register((message, overlay) -> {

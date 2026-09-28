@@ -2,7 +2,6 @@ package com.cokelord.skyblocksimplified.feature.impl;
 
 import com.cokelord.skyblocksimplified.feature.Feature;
 import com.cokelord.skyblocksimplified.feature.FeatureCategory;
-import com.cokelord.skyblocksimplified.feature.FeatureRegistry;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -12,16 +11,18 @@ import com.google.gson.JsonObject;
  * subtoggles about polling rates (like the slot locking), and a bunch of other features that the user can
  * turn off if they want more frames. This shouldn't including animation speeds and animation toggles, they
  * should go in the 'mod animations' module"): one consolidated panel for trading visual/detection quality
- * for frame rate, split into two kinds of subtoggle:
+ * for frame rate, split into two kinds of subtoggle (quick-access on/off mirrors of other modules used to live here too —
+ * removed, since switching one off read like a performance option but silently disabled the real module):
  * <ul>
- *   <li><b>Real throttles</b> — {@link #isReduceRarityBackgroundUpdates()} actually changes how often a
+ *   <li><b>Free real throttles</b> — {@link #isReduceRarityBackgroundUpdates()} actually changes how often a
  *       specific per-frame computation runs (see {@link ItemRarityBackgroundFeature}'s own cache), not just
- *       a proxy for some other setting.</li>
- *   <li><b>Quick-access mirrors</b> — the rest just read/write another feature's own existing enabled state
- *       (via {@link FeatureRegistry}) so a player chasing frames has one place to kill the heavier
- *       continuous scanners/3D renderers without hunting through several different categories for each one.
- *       Toggling one here and toggling the same feature from its own row are the exact same action; this
- *       panel doesn't duplicate or shadow that state, it's just a second, performance-focused door to it.</li>
+ *       a proxy for some other setting, with NO visible behavior change either way — a pure efficiency win,
+ *       so it defaults on.</li>
+ *   <li><b>Tradeoff real throttles</b> — {@link #isThrottleNametagHiding()}/{@link #isThrottleMaxorScan()}
+ *       also change how often a specific per-frame/per-tick scan runs, but unlike the free throttle above,
+ *       turning them on has a real, if minor, user-visible cost (documented in each toggle's own row
+ *       tooltip in MainScreen) — so unlike the free throttle, these default OFF, matching this panel's own
+ *       "opt into a visible tradeoff for more frames" framing rather than silently changing behavior.</li>
  * </ul>
  * Deliberately does NOT include animation durations/the master animation toggle — those already live in
  * GUI Animations per the user's own explicit instruction above.
@@ -40,6 +41,17 @@ public class PerformanceTogglesFeature extends Feature {
 	public static boolean isReduceRarityBackgroundUpdates() { return reduceRarityBackgroundUpdates; }
 	public void setReduceRarityBackgroundUpdates(boolean value) { reduceRarityBackgroundUpdates = value; }
 
+	// Tradeoff throttles — see this class's own doc comment for why these default OFF (unlike the free
+	// throttle above) and MainScreen's own row tooltips for each one's real, user-visible cost.
+	private static boolean throttleNametagHiding = false;
+	private static boolean throttleMaxorScan = false;
+
+	public static boolean isThrottleNametagHiding() { return throttleNametagHiding; }
+	public void setThrottleNametagHiding(boolean value) { throttleNametagHiding = value; }
+
+	public static boolean isThrottleMaxorScan() { return throttleMaxorScan; }
+	public void setThrottleMaxorScan(boolean value) { throttleMaxorScan = value; }
+
 	public PerformanceTogglesFeature() {
 		// Per user request: matches every other real feature module's default-off convention (see
 		// FeatureRegistry's own "actual feature modules default OFF" rule) — this wasn't following that
@@ -47,23 +59,12 @@ public class PerformanceTogglesFeature extends Feature {
 		super("performance_toggles", "Performance Toggles", FeatureCategory.PERFORMANCE, false);
 	}
 
-	/** Quick-access on/off mirror for another feature's own enabled state, keyed by that feature's real ID —
-	 *  reads live off {@link FeatureRegistry} rather than caching a stale copy, so this always matches
-	 *  whatever the target feature's own row shows. */
-	public static boolean isMirrorEnabled(String featureId) {
-		Feature f = FeatureRegistry.get(featureId);
-		return f != null && f.isEnabled();
-	}
-
-	public static void setMirrorEnabled(String featureId, boolean enabled) {
-		Feature f = FeatureRegistry.get(featureId);
-		if (f != null) f.setEnabled(enabled);
-	}
-
 	@Override
 	public JsonElement savePersistedData() {
 		JsonObject obj = new JsonObject();
 		obj.addProperty("reduceRarityBackgroundUpdates", reduceRarityBackgroundUpdates);
+		obj.addProperty("throttleNametagHiding", throttleNametagHiding);
+		obj.addProperty("throttleMaxorScan", throttleMaxorScan);
 		return obj;
 	}
 
@@ -72,6 +73,8 @@ public class PerformanceTogglesFeature extends Feature {
 		if (!el.isJsonObject()) return;
 		JsonObject obj = el.getAsJsonObject();
 		if (obj.has("reduceRarityBackgroundUpdates")) reduceRarityBackgroundUpdates = obj.get("reduceRarityBackgroundUpdates").getAsBoolean();
+		if (obj.has("throttleNametagHiding")) throttleNametagHiding = obj.get("throttleNametagHiding").getAsBoolean();
+		if (obj.has("throttleMaxorScan")) throttleMaxorScan = obj.get("throttleMaxorScan").getAsBoolean();
 	}
 
 	@Override
